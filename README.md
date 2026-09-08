@@ -59,7 +59,7 @@ python3 proxy.py
 ## Endpoints
 
 - `/health` — Health check
-- `/stats` — Compression statistics JSON (includes per-request skip-reason breakdown and tools savings)
+- `/stats` — Compression statistics JSON (per-request skip-reason breakdown, tools savings, upstream `usage`/`cost` when reported, and local pre/post token estimates via tiktoken)
 - `/dashboard` — Real-time dashboard UI
 - `/recovery/{handle}` — Retrieve original content
 - `/{path}` — Catch-all proxy to upstream

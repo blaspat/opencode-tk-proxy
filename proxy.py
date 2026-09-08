@@ -21,6 +21,8 @@ import time
 import sqlite3
 import logging
 import threading
+import asyncio
+import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 
@@ -121,6 +123,57 @@ def _recovery_stats() -> dict:
 
 # ─── Stats tracking ──────────────────────────────────────────────────────────
 REQUEST_STATS: deque[dict] = deque(maxlen=100)
+
+# ── Token estimation (best-effort, local) ────────────────────────────────────
+_TOKEN_ENC = None
+
+def _get_encoder():
+    """Lazily load tiktoken o200k encoder; returns None if unavailable."""
+    global _TOKEN_ENC
+    if _TOKEN_ENC is None:
+        try:
+            import tiktoken
+            _TOKEN_ENC = tiktoken.get_encoding("o200k_base")
+        except Exception:
+            _TOKEN_ENC = False
+    return _TOKEN_ENC or None
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count: tiktoken o200k when available, else chars/4 heuristic."""
+    if not text:
+        return 0
+    enc = _get_encoder()
+    if enc is None:
+        return max(1, len(text) // 4)
+    try:
+        return len(enc.encode(text))
+    except Exception:
+        return max(1, len(text) // 4)
+
+
+def _find_entry(req_id: str) -> dict | None:
+    """Find a stats entry by its request id (stats deque is small)."""
+    for e in REQUEST_STATS:
+        if e.get("req_id") == req_id:
+            return e
+    return None
+
+
+async def _backfill_token_stats(req_id: str, original: bytes, compressed: bytes):
+    """Compute pre/post-compression token estimates off the event loop,
+    then attach them to the request's stats entry."""
+    try:
+        orig_tok = await asyncio.to_thread(_estimate_tokens, original.decode("utf-8", errors="replace"))
+        comp_tok = await asyncio.to_thread(_estimate_tokens, compressed.decode("utf-8", errors="replace"))
+    except Exception:
+        return
+    entry = _find_entry(req_id)
+    if entry is not None:
+        entry["tokens_est_original"] = orig_tok
+        entry["tokens_est_compressed"] = comp_tok
+        entry["tokens_est_saved"] = orig_tok - comp_tok
+        entry["tokens_est_method"] = "tiktoken" if _get_encoder() is not None else "chars4"
 
 logging.basicConfig(
     level=logging.DEBUG if VERBOSE else logging.INFO,
@@ -1136,6 +1189,8 @@ async def stats():
         "skipped_totals": skipped_totals,
         "tools_saved_total": sum(e.get("tools_saved_chars", 0) for e in entries),
         "recovery_store": _recovery_stats(),
+        "tokens_est_saved_total": sum(e.get("tokens_est_saved", 0) for e in entries),
+        "upstream_prompt_tokens_total": sum(e.get("upstream_prompt_tokens") or 0 for e in entries),
     }
 
 
@@ -1196,6 +1251,8 @@ async def proxy(request: Request, path: str):
         headers["authorization"] = f"Bearer {UPSTREAM_KEY}"
 
     body = await request.body()
+    original_body = body
+    req_id = uuid.uuid4().hex
 
     # ── Compression pass ────────────────────────────────────────────────────
     total_saved = 0
@@ -1303,16 +1360,50 @@ async def proxy(request: Request, path: str):
                 "tools_compressed": tools_compressed,
                 "tools_saved_chars": tools_saved_chars,
                 "streaming": is_streaming,
+                "req_id": req_id,
             })
+            if total_saved > 0:
+                asyncio.create_task(_backfill_token_stats(req_id, original_body, body))
 
         if is_sse:
             async def relay():
+                captured_usage: dict = {}
+                captured_cost = None
+                pending = b""
                 try:
                     async for chunk in upstream.aiter_bytes():
+                        if chunk:
+                            pending += chunk
+                            parts = pending.split(b"\n\n")
+                            pending = parts.pop()
+                            for part in parts:
+                                if b"usage" not in part and b"cost" not in part:
+                                    continue
+                                for line in part.splitlines():
+                                    if not line.startswith(b"data:"):
+                                        continue
+                                    try:
+                                        evt = json.loads(line[5:].strip())
+                                    except (json.JSONDecodeError, ValueError):
+                                        continue
+                                    if not isinstance(evt, dict):
+                                        continue
+                                    if isinstance(evt.get("usage"), dict):
+                                        captured_usage.update(evt["usage"])
+                                    if "cost" in evt and captured_cost is None:
+                                        captured_cost = evt.get("cost")
                         yield chunk
                 finally:
                     await upstream.aclose()
                     await upstream_ctx.__aexit__(None, None, None)
+                    if path == "v1/chat/completions":
+                        entry = _find_entry(req_id)
+                        if entry is not None:
+                            if captured_usage:
+                                entry["upstream_usage"] = captured_usage
+                                entry["upstream_prompt_tokens"] = captured_usage.get("prompt_tokens")
+                            if captured_cost is not None:
+                                entry["upstream_cost"] = captured_cost
 
             resp_headers = {
                 k: v for k, v in upstream.headers.items()
@@ -1327,6 +1418,19 @@ async def proxy(request: Request, path: str):
         else:
             try:
                 resp_body = await upstream.aread()
+                if path == "v1/chat/completions":
+                    entry = _find_entry(req_id)
+                    if entry is not None:
+                        try:
+                            resp_json = json.loads(resp_body)
+                        except (json.JSONDecodeError, ValueError):
+                            resp_json = None
+                        if isinstance(resp_json, dict):
+                            if isinstance(resp_json.get("usage"), dict):
+                                entry["upstream_usage"] = resp_json["usage"]
+                                entry["upstream_prompt_tokens"] = resp_json["usage"].get("prompt_tokens")
+                            if "cost" in resp_json:
+                                entry["upstream_cost"] = resp_json.get("cost")
             finally:
                 await upstream.aclose()
 
