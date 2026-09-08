@@ -604,6 +604,109 @@ def _compress_system_prompt(text: str, ratio: float = 0.50) -> str:
 
 # ─── Tool Schema compressor ──────────────────────────────────────────────────
 
+def _compress_schema_obj(obj):
+    """Recursively compress a JSON schema object: keep keys/types/structure,
+    truncate verbose description strings. Used by schema and tools compression."""
+    if isinstance(obj, dict):
+        compressed = {}
+        for k, v in obj.items():
+            if k == "description" and isinstance(v, str):
+                # Truncate verbose descriptions to first 100 chars
+                # Remove code blocks (```...```)
+                v = re.sub(r"```[\s\S]*?```", "[code example removed]", v)
+                # Remove inline examples
+                v = re.sub(r"(?:e\.g\.|example|for example)[^.]*\.", "eg.", v, flags=re.IGNORECASE)
+                if len(v) > 100:
+                    v = v[:97] + "..."
+                compressed[k] = v
+            elif isinstance(v, dict):
+                compressed[k] = _compress_schema_obj(v)
+            elif isinstance(v, list):
+                compressed[k] = _compress_schema_obj(v)
+            else:
+                # Keep scalar values (type, name, enum, format, default, etc.)
+                compressed[k] = v
+        return compressed
+    elif isinstance(obj, list):
+        return [_compress_schema_obj(item) for item in obj]
+    return obj
+
+
+def _compress_tools(tools: list) -> tuple[list, int]:
+    """Compress an OpenAI tools/functions array: truncate long descriptions,
+    compress parameter-schema descriptions. Names/types/enums/required preserved.
+    Returns (new_tools, chars_saved)."""
+    new_tools = []
+    saved = 0
+    for tool in tools:
+        if not isinstance(tool, dict):
+            new_tools.append(tool)
+            continue
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            new_tools.append(tool)
+            continue
+        new_function = dict(function)
+        desc = function.get("description")
+        if isinstance(desc, str) and len(desc) > 120:
+            new_function["description"] = desc[:117] + "..."
+            saved += len(desc) - len(new_function["description"])
+        params = function.get("parameters")
+        if isinstance(params, dict):
+            before = json.dumps(params, separators=(",", ":"))
+            new_function["parameters"] = _compress_schema_obj(params)
+            after = json.dumps(new_function["parameters"], separators=(",", ":"))
+            if len(after) < len(before):
+                saved += len(before) - len(after)
+        new_tools.append(dict(tool, function=new_function))
+    return new_tools, saved
+
+
+# Structural JSON compression for large JSON tool results
+_MAX_JSON_STRING_LEN = 600
+
+def _maybe_json_content(text: str) -> bool:
+    """True when text is large enough to matter and parses as a JSON doc (dict/list)."""
+    if not text or len(text) < 1000:
+        return False
+    if text.lstrip()[:1] not in ("{", "["):
+        return False
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return isinstance(obj, (dict, list))
+
+
+def _compress_json_obj(obj):
+    """Recursively shrink long strings in a parsed JSON value; keep keys/types."""
+    if isinstance(obj, dict):
+        return {k: _compress_json_obj(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_compress_json_obj(v) for v in obj]
+    if isinstance(obj, str) and len(obj) > _MAX_JSON_STRING_LEN:
+        return obj[:450] + f"\n[...truncated: {len(obj)} chars...]" + obj[-150:]
+    return obj
+
+
+def _compress_json_content(text: str) -> str:
+    """Structural JSON compression: preserve all keys/numbers/bools, truncate long strings.
+    Returns original text when JSON is unparseable or there is no size gain."""
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return text
+    if not isinstance(obj, (dict, list)):
+        return text
+    try:
+        result = json.dumps(_compress_json_obj(obj), separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        return text
+    if len(result) >= len(text):
+        return text
+    return result
+
+
 def _compress_tool_schema(text: str, ratio: float = 0.50) -> str:
     """Compress tool schemas: truncate verbose descriptions, keep structure.
     - Truncate verbose tool descriptions to first 100 chars
@@ -624,33 +727,6 @@ def _compress_tool_schema(text: str, ratio: float = 0.50) -> str:
     except (json.JSONDecodeError, TypeError):
         # Not valid JSON — fall back to text compression
         return _compress_text(text, ratio)
-
-    def _compress_schema_obj(obj):
-        """Recursively compress a schema object."""
-        if isinstance(obj, dict):
-            compressed = {}
-            for k, v in obj.items():
-                if k == "description" and isinstance(v, str):
-                    # Truncate verbose descriptions to first 100 chars
-                    # Remove code blocks (```...```)
-                    v = re.sub(r"```[\s\S]*?```", "[code example removed]", v)
-                    # Remove inline examples
-                    v = re.sub(r"(?:e\.g\.|example|for example)[^.]*\.", "eg.", v, flags=re.IGNORECASE)
-                    if len(v) > 100:
-                        v = v[:97] + "..."
-                    compressed[k] = v
-                elif isinstance(v, dict):
-                    # Recurse into nested dicts (function, parameters, properties, etc.)
-                    compressed[k] = _compress_schema_obj(v)
-                elif isinstance(v, list):
-                    compressed[k] = _compress_schema_obj(v)
-                else:
-                    # Keep scalar values (type, name, enum, format, default, etc.)
-                    compressed[k] = v
-            return compressed
-        elif isinstance(obj, list):
-            return [_compress_schema_obj(item) for item in obj]
-        return obj
 
     try:
         compressed = _compress_schema_obj(data)
@@ -908,8 +984,8 @@ def _compress_for_role(text: str, role: str, query: str = None) -> str:
         elif content_type == "log":
             return _compress_log(text)
         elif content_type == "json":
-            # JSON should not be compressed (structured data)
-            return text
+            # Structural JSON compression: keep keys/numbers, truncate long strings
+            return _compress_json_content(text)
         elif content_type == "diff":
             return _compress_diff(text)
         elif content_type == "tool_schema":
@@ -929,9 +1005,10 @@ def _compress_for_role(text: str, role: str, query: str = None) -> str:
         return _compress_text(text)
     return _compress_text(text)
 
-def _try_compress_message(msg: dict) -> tuple[dict, int]:
+def _try_compress_message(msg: dict, skipped: dict | None = None) -> tuple[dict, int]:
     """Try to compress a message. Returns (possibly modified msg, chars saved).
-    Stores original content in recovery store before compression."""
+    Stores original content in recovery store before compression.
+    `skipped` (optional dict of reason->count) accumulates messages NOT compressed."""
     role = msg.get("role", "")
     content = msg.get("content", "")
     has_tool_calls = bool(msg.get("tool_calls"))
@@ -946,10 +1023,22 @@ def _try_compress_message(msg: dict) -> tuple[dict, int]:
         text_content = "\n".join(text_parts)
 
     if not text_content or len(text_content) <= 200:
+        if skipped is not None:
+            skipped["too_small"] = skipped.get("too_small", 0) + 1
+        return msg, 0
+
+    if has_tool_calls:
+        if skipped is not None:
+            skipped["tool_calls"] = skipped.get("tool_calls", 0) + 1
         return msg, 0
 
     label = _classify_message(text_content, role, has_tool_calls)
+    # Large JSON tool results: structurally compress instead of skipping as verbatim
+    if label != "compressible" and role == "tool" and _maybe_json_content(text_content):
+        label = "compressible"
     if label != "compressible":
+        if skipped is not None:
+            skipped["verbatim"] = skipped.get("verbatim", 0) + 1
         return msg, 0
 
     # Store original in recovery store before lossy compression
@@ -961,6 +1050,8 @@ def _try_compress_message(msg: dict) -> tuple[dict, int]:
         compressed = _compress_for_role(content, role)
         saved = len(content) - len(compressed)
         if saved <= 0:
+            if skipped is not None:
+                skipped["no_saving"] = skipped.get("no_saving", 0) + 1
             return msg, 0
         # Append recovery handle as comment
         new_msg["content"] = compressed + f"\n[ccr:{recovery_handle}]"
@@ -984,6 +1075,8 @@ def _try_compress_message(msg: dict) -> tuple[dict, int]:
             else:
                 new_parts.append(p)
         if total_saved <= 0:
+            if skipped is not None:
+                skipped["no_saving"] = skipped.get("no_saving", 0) + 1
             return msg, 0
         # Append recovery handle to last text part
         if new_parts and isinstance(new_parts[-1], dict) and new_parts[-1].get("type") == "text":
@@ -1031,11 +1124,17 @@ async def stats():
     total_requests = len(entries)
     total_chars_saved = sum(e["chars_saved"] for e in entries)
     avg_ratio = sum(e["compression_ratio"] for e in entries) / total_requests if total_requests else 0
+    skipped_totals = {}
+    for e in entries:
+        for k, v in (e.get("skipped") or {}).items():
+            skipped_totals[k] = skipped_totals.get(k, 0) + v
     return {
         "total_requests": total_requests,
         "total_chars_saved": total_chars_saved,
         "avg_compression_ratio": round(avg_ratio, 1),
         "recent": entries[-20:],
+        "skipped_totals": skipped_totals,
+        "tools_saved_total": sum(e.get("tools_saved_chars", 0) for e in entries),
         "recovery_store": _recovery_stats(),
     }
 
@@ -1105,25 +1204,42 @@ async def proxy(request: Request, path: str):
     messages_compressed = 0
     messages_total = 0
     is_streaming = False
+    skipped = {"too_small": 0, "tool_calls": 0, "verbatim": 0, "no_saving": 0}
+    tools_compressed = 0
+    tools_saved_chars = 0
     if COMPRESS_ENABLED and body and request.method in ("POST", "PUT", "PATCH"):
         try:
             payload = json.loads(body)
-            messages = payload.get("messages")
-            if isinstance(messages, list):
-                messages_total = len(messages)
-                new_messages = []
-                for msg in messages:
-                    compressed_msg, saved = _try_compress_message(msg)
-                    total_saved += saved
-                    if saved > 0:
-                        messages_compressed += 1
-                    new_messages.append(compressed_msg)
-                if total_saved > 0:
-                    payload["messages"] = new_messages
+            if isinstance(payload, dict):
+                messages = payload.get("messages")
+                if isinstance(messages, list):
+                    messages_total = len(messages)
+                    new_messages = []
+                    for msg in messages:
+                        compressed_msg, saved = _try_compress_message(msg, skipped)
+                        total_saved += saved
+                        if saved > 0:
+                            messages_compressed += 1
+                        new_messages.append(compressed_msg)
+                    if total_saved > 0:
+                        payload["messages"] = new_messages
+
+                # Compress the tools/functions arrays (reshipped on every request)
+                for key in ("tools", "functions"):
+                    items = payload.get(key)
+                    if isinstance(items, list) and items:
+                        new_items, t_saved = _compress_tools(items)
+                        if t_saved > 0:
+                            payload[key] = new_items
+                            tools_compressed = len(items)
+                            tools_saved_chars += t_saved
+
+                if total_saved > 0 or tools_saved_chars > 0:
+                    total_saved += tools_saved_chars
                     body = json.dumps(payload).encode("utf-8")
                     compressed_size = len(body)
-                    log.info("Compressed %d chars across messages", total_saved)
-        except (json.JSONDecodeError, TypeError):
+                    log.info("Compressed %d chars across messages + tools", total_saved)
+        except (json.JSONDecodeError, TypeError, AttributeError):
             pass  # not JSON — forward as-is
 
     log.debug("%s %s → %s (%d bytes)", request.method, path, url, len(body))
@@ -1183,6 +1299,9 @@ async def proxy(request: Request, path: str):
                 "compression_ratio": round(ratio, 1),
                 "messages_compressed": messages_compressed,
                 "messages_total": messages_total,
+                "skipped": skipped,
+                "tools_compressed": tools_compressed,
+                "tools_saved_chars": tools_saved_chars,
                 "streaming": is_streaming,
             })
 

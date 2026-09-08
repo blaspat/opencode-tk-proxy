@@ -6,6 +6,8 @@ An OpenAI-compatible proxy for Hermes Agent that sits between Hermes and LLM pro
 
 - **Session Header Injection** — Automatically injects `x-opencode-session` header for opencode-go compatibility
 - **Content-Type Aware Compression** — Detects and compresses different content types appropriately
+- **Tools-Array Compression** — Truncates verbose tool/function descriptions and parameter schema text (names/types/enums preserved)
+- **Structural JSON Compression** — Large JSON tool results keep all keys/numbers/bools; long string values are truncated with a marker
 - **Smart Compressors**:
   - Terminal output (ANSI strip, noise removal)
   - Log files (timestamp strip, level filtering)
@@ -57,7 +59,7 @@ python3 proxy.py
 ## Endpoints
 
 - `/health` — Health check
-- `/stats` — Compression statistics JSON
+- `/stats` — Compression statistics JSON (includes per-request skip-reason breakdown and tools savings)
 - `/dashboard` — Real-time dashboard UI
 - `/recovery/{handle}` — Retrieve original content
 - `/{path}` — Catch-all proxy to upstream
