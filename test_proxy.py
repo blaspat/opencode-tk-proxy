@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import asyncio
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -172,6 +173,47 @@ class ProxyEndToEndTests(unittest.TestCase):
         entry = proxy.REQUEST_STATS[-1]
         self.assertGreater(entry["tools_saved_chars"], 0)
         self.assertIn("skipped", entry)
+
+    def test_upstream_usage_captured_non_stream(self):
+        usage_body = json.dumps({
+            "id": "gen-1", "object": "chat.completion", "model": "mimo-v2.5",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 123, "completion_tokens": 4, "total_tokens": 127,
+                      "prompt_tokens_details": {"cached_tokens": 100}},
+            "cost": "0.0001",
+        }).encode()
+        payload = {"model": "test", "messages": [
+            {"role": "tool", "tool_call_id": "t1",
+             "content": json.dumps({"rows": [{"d": "q" * 4000} for _ in range(8)]})},
+            {"role": "user", "content": "hi"},
+        ]}
+        upstream = _FakeUpstream(_resp(usage_body))
+        with TestClient(proxy.app) as client:
+            proxy._http = upstream
+            r = client.post("/v1/chat/completions", json=payload)
+        self.assertEqual(r.status_code, 200)
+        entry = proxy.REQUEST_STATS[-1]
+        self.assertEqual(entry["upstream_prompt_tokens"], 123)
+        self.assertEqual(entry["upstream_cost"], "0.0001")
+        self.assertEqual(entry["upstream_usage"]["prompt_tokens_details"]["cached_tokens"], 100)
+
+    def test_token_estimate_and_backfill(self):
+        self.assertEqual(proxy._estimate_tokens(""), 0)
+        self.assertEqual(proxy._estimate_tokens("hello world"), 2)  # o200k
+        self.assertGreater(proxy._estimate_tokens("x" * 10000), 100)
+
+        proxy.REQUEST_STATS.clear()
+        req_id = "test-abc"
+        proxy.REQUEST_STATS.append({"req_id": req_id, "chars_saved": 1})
+        orig = json.dumps({"rows": [{"id": i, "data": "y" * 3000} for i in range(10)]}).encode()
+        comp = proxy._compress_json_content(orig.decode()).encode()
+        asyncio.run(proxy._backfill_token_stats(req_id, orig, comp))
+        entry = proxy.REQUEST_STATS[-1]
+        self.assertGreater(entry["tokens_est_original"], 0)
+        self.assertGreater(entry["tokens_est_saved"], 0)
+        self.assertLess(entry["tokens_est_compressed"], entry["tokens_est_original"])
+        self.assertEqual(entry["tokens_est_method"], "tiktoken")
 
     def test_non_json_body_passthrough(self):
         upstream = _FakeUpstream(_resp(b'{"ok": true}'))
