@@ -1,245 +1,116 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Hermes Proxy — Compression Stats</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
-    background: #0d1117;
-    color: #c9d1d9;
-    padding: 24px;
-  }
-  h1 {
-    font-size: 20px;
-    font-weight: 600;
-    color: #58a6ff;
-    margin-bottom: 16px;
-  }
-  .summary {
-    display: flex;
-    gap: 16px;
-    margin-bottom: 24px;
-  }
-  .card {
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 8px;
-    padding: 16px 24px;
-    min-width: 180px;
-  }
-  .card .label {
-    font-size: 11px;
-    color: #8b949e;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    margin-bottom: 4px;
-  }
-  .card .value {
-    font-size: 28px;
-    font-weight: 700;
-    color: #f0f6fc;
-  }
+  body { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; background: #0d1117; color: #c9d1d9; padding: 24px; }
+  .header { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #3fb950; animation: pulse 2s infinite; }
+  h1 { font-size: 20px; color: #58a6ff; font-weight: 600; }
+  .refresh-info { font-size: 11px; color: #484f58; margin-left: auto; }
+  .summary { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 24px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px 20px; min-width: 170px; }
+  .card .label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+  .card .value { font-size: 26px; font-weight: 700; color: #f0f6fc; }
   .card .value.green { color: #3fb950; }
   .card .value.yellow { color: #d29922; }
   .card .value.red { color: #f85149; }
   .card .value.blue { color: #58a6ff; }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 8px;
-    overflow: hidden;
-  }
-  th {
-    background: #1c2128;
-    color: #8b949e;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    padding: 10px 12px;
-    text-align: left;
-    border-bottom: 1px solid #30363d;
-  }
-  td {
-    padding: 8px 12px;
-    border-bottom: 1px solid #21262d;
-    font-size: 13px;
-  }
+  table { width: 100%; border-collapse: collapse; background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+  th { background: #1c2128; color: #8b949e; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; padding: 10px 12px; text-align: left; border-bottom: 1px solid #30363d; white-space: nowrap; }
+  td { padding: 8px 12px; border-bottom: 1px solid #21262d; font-size: 13px; }
   tr:last-child td { border-bottom: none; }
   tr:hover { background: #1c2128; }
-  .ratio-badge {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 12px;
-    font-size: 12px;
-    font-weight: 600;
-  }
-  .ratio-green { background: #238636; color: #fff; }
-  .ratio-yellow { background: #9e6a03; color: #fff; }
-  .ratio-red { background: #da3633; color: #fff; }
-  .no-data {
-    text-align: center;
-    padding: 40px;
-    color: #8b949e;
-    font-size: 14px;
-  }
-  .stream-badge {
-    font-size: 10px;
-    padding: 1px 6px;
-    border-radius: 4px;
-    background: #30363d;
-    color: #8b949e;
-  }
-  .stream-badge.yes {
-    background: #1f3a5f;
-    color: #58a6ff;
-  }
-  .status-dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #3fb950;
-    margin-right: 6px;
-    animation: pulse 2s infinite;
-  }
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-  }
-  .header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 16px;
-  }
-  .refresh-info {
-    font-size: 11px;
-    color: #484f58;
-    margin-left: auto;
-  }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; background: #21262d; color: #8b949e; }
+  .badge.yes { background: #1f3a5f; color: #58a6ff; }
+  .no-data { text-align: center; color: #484f58; padding: 24px; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 </style>
 </head>
 <body>
-  <div class="header">
-    <span class="status-dot"></span>
-    <h1>Hermes Proxy — Compression Stats</h1>
-    <span class="refresh-info" id="refresh-info">Loading...</span>
-  </div>
+<div class="header">
+  <span class="status-dot"></span>
+  <h1>Hermes Proxy — Compression Stats</h1>
+  <span class="refresh-info" id="refresh-info">Loading...</span>
+</div>
 
-  <div class="summary">
-    <div class="card">
-      <div class="label">Total Requests</div>
-      <div class="value blue" id="total-requests">—</div>
-    </div>
-    <div class="card">
-      <div class="label">Total Chars Saved</div>
-      <div class="value green" id="total-saved">—</div>
-    </div>
-    <div class="card">
-      <div class="label">Avg Compression Ratio</div>
-      <div class="value" id="avg-ratio">—</div>
-    </div>
-    <div class="card">
-      <div class="label">Bytes Saved (total)</div>
-      <div class="value blue" id="total-bytes">—</div>
-    </div>
-  </div>
+<div class="summary">
+  <div class="card"><div class="label">Total Requests</div><div class="value" id="total-requests">—</div></div>
+  <div class="card"><div class="label">Total Chars Saved</div><div class="value green" id="total-saved">—</div></div>
+  <div class="card"><div class="label">Avg Compression Ratio</div><div class="value blue" id="avg-ratio">—</div></div>
+  <div class="card"><div class="label">Tokens Saved (est)</div><div class="value green" id="tokens-saved">—</div></div>
+  <div class="card"><div class="label">Upstream Prompt Tokens</div><div class="value" id="upstream-tokens">—</div></div>
+  <div class="card"><div class="label">Tools Saved (chars)</div><div class="value yellow" id="tools-saved">—</div></div>
+</div>
 
-  <table>
-    <thead>
-      <tr>
-        <th>Time</th>
-        <th>Method</th>
-        <th>Path</th>
-        <th>Original</th>
-        <th>Compressed</th>
-        <th>Saved</th>
-        <th>Ratio</th>
-        <th>Messages</th>
-        <th>Stream</th>
-      </tr>
-    </thead>
-    <tbody id="stats-body">
-      <tr><td colspan="9" class="no-data">Waiting for data...</td></tr>
-    </tbody>
-  </table>
+<table>
+  <thead>
+    <tr>
+      <th>Time</th><th>Method</th><th>Path</th><th>Original</th><th>Compressed</th>
+      <th>Saved</th><th>Ratio</th><th>Msgs</th><th>Tokens Saved</th><th>Upstream Tokens</th><th>Stream</th>
+    </tr>
+  </thead>
+  <tbody id="stats-body">
+    <tr><td colspan="11" class="no-data">Waiting for data...</td></tr>
+  </tbody>
+</table>
 
 <script>
-function formatBytes(b) {
-  if (b === 0) return '0 B';
-  if (b < 1024) return b + ' B';
-  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
-  return (b / 1048576).toFixed(1) + ' MB';
+function fmt(n) {
+  if (n === null || n === undefined || isNaN(n)) return '—';
+  if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + 'G';
+  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(Math.round(n));
 }
-
-function formatNum(n) {
-  return n.toLocaleString();
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
 }
-
-function ratioClass(r) {
-  if (r > 30) return 'ratio-green';
-  if (r >= 10) return 'ratio-yellow';
-  return 'ratio-red';
-}
-
-function valueColor(r) {
-  if (r > 30) return 'green';
-  if (r >= 10) return 'yellow';
-  return 'red';
-}
-
 async function refresh() {
   try {
-    const res = await fetch('/stats');
-    const data = await res.json();
-
-    document.getElementById('total-requests').textContent = formatNum(data.total_requests);
-    document.getElementById('total-saved').textContent = formatNum(data.total_chars_saved);
-    const avg = data.avg_compression_ratio;
-    const avgEl = document.getElementById('avg-ratio');
-    avgEl.textContent = avg + '%';
-    avgEl.className = 'value ' + valueColor(avg);
-
-    // Calculate total bytes saved from recent
-    const totalBytes = data.recent.reduce((s, r) => s + r.chars_saved, 0);
-    document.getElementById('total-bytes').textContent = formatBytes(totalBytes);
-
+    const r = await fetch('/stats');
+    const d = await r.json();
+    document.getElementById('total-requests').textContent = d.total_requests;
+    document.getElementById('total-saved').textContent = fmt(d.total_chars_saved) + ' chars';
+    document.getElementById('avg-ratio').textContent = d.avg_compression_ratio + '%';
+    document.getElementById('tokens-saved').textContent = fmt(d.tokens_est_saved_total || 0);
+    document.getElementById('upstream-tokens').textContent = fmt(d.upstream_prompt_tokens_total);
+    document.getElementById('tools-saved').textContent = fmt(d.tools_saved_total);
+    document.getElementById('refresh-info').textContent = new Date().toLocaleTimeString() + ' · ' + d.total_requests + ' reqs';
     const body = document.getElementById('stats-body');
-    if (!data.recent || data.recent.length === 0) {
-      body.innerHTML = '<tr><td colspan="9" class="no-data">No requests yet — send something through the proxy</td></tr>';
+    const rows = (d.recent || []).slice().reverse();
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="11" class="no-data">No requests yet</td></tr>';
       return;
     }
-
-    // Show most recent first
-    const rows = data.recent.slice().reverse().map(r => {
-      const rc = ratioClass(r.compression_ratio);
-      return `<tr>
-        <td style="white-space:nowrap">${r.time_str}</td>
-        <td>${r.method}</td>
-        <td title="${r.path}" style="max-width:300px;overflow:hidden;text-overflow:ellipsis">${r.path}</td>
-        <td>${formatBytes(r.original_size)}</td>
-        <td>${formatBytes(r.compressed_size)}</td>
-        <td>${formatNum(r.chars_saved)}</td>
-        <td><span class="ratio-badge ${rc}">${r.compression_ratio}%</span></td>
-        <td>${r.messages_compressed}/${r.messages_total}</td>
-        <td><span class="stream-badge ${r.streaming ? 'yes' : ''}">${r.streaming ? 'SSE' : '—'}</span></td>
-      </tr>`;
-    });
-    body.innerHTML = rows.join('');
-
-    const now = new Date().toLocaleTimeString();
-    document.getElementById('refresh-info').textContent = 'Last refresh: ' + now;
+    body.innerHTML = rows.map(function (r) {
+      const ratio = r.compression_ratio;
+      const tSaved = r.tokens_est_saved;
+      const upTok = r.upstream_prompt_tokens;
+      const msgs = r.messages_total ? (r.messages_compressed + '/' + r.messages_total) : '—';
+      return '<tr>' +
+        '<td>' + escapeHtml(r.time_str || '') + '</td>' +
+        '<td>' + escapeHtml(r.method || '') + '</td>' +
+        '<td>' + escapeHtml(r.path || '') + '</td>' +
+        '<td>' + fmt(r.original_size) + '</td>' +
+        '<td>' + fmt(r.compressed_size) + '</td>' +
+        '<td style="color:#3fb950">' + fmt(r.chars_saved) + '</td>' +
+        '<td><span class="badge">' + ratio.toFixed(1) + '%</span></td>' +
+        '<td>' + msgs + '</td>' +
+        '<td>' + (tSaved !== undefined ? fmt(tSaved) : '—') + '</td>' +
+        '<td>' + (upTok ? fmt(upTok) : '—') + '</td>' +
+        '<td><span class="badge ' + (r.streaming ? 'yes' : '') + '">' + (r.streaming ? 'stream' : 'sync') + '</span></td>' +
+        '</tr>';
+    }).join('');
   } catch (e) {
     document.getElementById('refresh-info').textContent = 'Error: ' + e.message;
   }
 }
-
 refresh();
 setInterval(refresh, 2000);
 </script>
