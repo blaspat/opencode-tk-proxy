@@ -1,6 +1,6 @@
-# Hermes LLM Proxy
+# Opencode LLM Proxy
 
-An OpenAI-compatible proxy for Hermes Agent that sits between Hermes and LLM providers, injecting session headers and compressing input to reduce token costs.
+An OpenAI-compatible proxy for Opencode, injecting session headers and compressing input to reduce token costs.
 
 ## Features
 
