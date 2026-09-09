@@ -80,6 +80,38 @@ CUSTOM_BASE_URL=http://127.0.0.1:8787/v1
 CUSTOM_API_KEY=your-api-key
 ```
 
+## Use from the opencode CLI
+
+The proxy is an OpenAI-compatible endpoint upstream of opencode's own gateway
+(`UPSTREAM_URL` defaults to `https://opencode.ai/zen/go/v1`) and injects the
+`x-opencode-session` header opencode expects, so the opencode CLI can be pointed
+at it directly and pick up compression automatically. Incoming API keys are
+ignored — the proxy always authenticates upstream with its own `UPSTREAM_KEY`.
+
+Add a provider in `opencode.json`:
+
+```json
+{
+  "provider": {
+    "hermes-proxy": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "***"
+      }
+    }
+  },
+  "model": "hermes-proxy/mimo-v2.5"
+}
+```
+
+Notes:
+- The proxy binds `127.0.0.1`, so the CLI must run on the same host (remote
+  use requires exposing the port).
+- The model id must be one the upstream accepts (the default config's
+  `mimo-v2.5` is what the test harness uses).
+- CLI traffic appears in `/stats` and the recovery store like any other client.
+
 ## Install as Service
 
 ```bash
