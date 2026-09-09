@@ -28,8 +28,12 @@ An OpenAI-compatible proxy for Hermes Agent that sits between Hermes and LLM pro
 git clone https://github.com/blaspat/opencode-tk-proxy.git
 cd opencode-tk-proxy
 
+# Create virtual environment (recommended)
+python3 -m venv venv
+source venv/bin/activate
+
 # Install dependencies
-pip install fastapi uvicorn httpx python-dotenv
+pip install -r requirements.txt
 
 # Create .env file
 cat > .env << 'EOF'
@@ -147,6 +151,13 @@ Production average on live traffic (`/stats` `avg_compression_ratio`): ~43%.
 git clone https://github.com/blaspat/hermes-proxy.git
 cd hermes-proxy
 
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
 # Create a .env file with your config
 cat > .env <<EOF
 UPSTREAM_URL=https://your-llm-provider.com/v1
@@ -164,7 +175,7 @@ After=network.target
 Type=simple
 User=$(whoami)
 WorkingDirectory=$(pwd)
-ExecStart=$(which python3) $(pwd)/proxy.py
+ExecStart=$(pwd)/venv/bin/python3 $(pwd)/proxy.py
 Restart=on-failure
 RestartSec=5
 
