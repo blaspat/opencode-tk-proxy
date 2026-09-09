@@ -697,8 +697,12 @@ def _compress_tools(tools: list) -> tuple[list, int]:
             continue
         function = tool.get("function")
         if not isinstance(function, dict):
-            new_tools.append(tool)
-            continue
+            # Responses API flat format: {type:"function", name, description, parameters}
+            if tool.get("type") == "function" and isinstance(tool.get("name"), str):
+                function = tool
+            else:
+                new_tools.append(tool)
+                continue
         new_function = dict(function)
         desc = function.get("description")
         if isinstance(desc, str) and len(desc) > 120:
@@ -711,7 +715,10 @@ def _compress_tools(tools: list) -> tuple[list, int]:
             after = json.dumps(new_function["parameters"], separators=(",", ":"))
             if len(after) < len(before):
                 saved += len(before) - len(after)
-        new_tools.append(dict(tool, function=new_function))
+        if function is tool:  # flat Responses format — keep flat
+            new_tools.append(new_function)
+        else:
+            new_tools.append(dict(tool, function=new_function))
     return new_tools, saved
 
 
@@ -1072,7 +1079,7 @@ def _try_compress_message(msg: dict, skipped: dict | None = None) -> tuple[dict,
         text_content = content
     elif isinstance(content, list):
         # Fix #3: compress each text part individually, not all with same string
-        text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+        text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ("text", "input_text")]
         text_content = "\n".join(text_parts)
 
     if not text_content or len(text_content) <= 200:
@@ -1113,7 +1120,7 @@ def _try_compress_message(msg: dict, skipped: dict | None = None) -> tuple[dict,
         total_saved = 0
         new_parts = []
         for p in content:
-            if isinstance(p, dict) and p.get("type") == "text":
+            if isinstance(p, dict) and p.get("type") in ("text", "input_text"):
                 part_text = p.get("text", "")
                 if part_text and len(part_text) > 200:
                     compressed_part = _compress_for_role(part_text, role)
@@ -1142,6 +1149,42 @@ def _try_compress_message(msg: dict, skipped: dict | None = None) -> tuple[dict,
         return msg, 0
 
     return new_msg, saved
+
+
+def _compress_responses_items(items: list, skipped: dict | None = None) -> tuple[list, int]:
+    """Compress a Responses API `input` item list.
+
+    Reusable shapes are mapped onto chat messages and routed through
+    _try_compress_message; everything else (function_call, reasoning,
+    item_reference, mcp_*, ...) is forwarded untouched.
+    Returns (new_items, chars saved)."""
+    new_items = []
+    saved_total = 0
+    for item in items:
+        if not isinstance(item, dict):
+            new_items.append(item)
+            continue
+        itype = item.get("type")
+        if itype in (None, "message"):
+            # EasyInputMessage / Message: role + content — same shape as chat
+            msg, saved = _try_compress_message(item, skipped)
+            saved_total += saved
+            new_items.append(msg)
+        elif itype == "function_call_output":
+            # Tool result: {type, call_id, output}. Map onto a synthetic
+            # chat tool message so the result compressor + recovery path apply.
+            output = item.get("output")
+            text = output if isinstance(output, str) else (
+                json.dumps(output) if output is not None else "")
+            synthetic = {"role": "tool", "content": text}
+            compressed_msg, saved = _try_compress_message(synthetic, skipped)
+            if saved > 0:
+                saved_total += saved
+                item = dict(item, output=compressed_msg["content"])
+            new_items.append(item)
+        else:
+            new_items.append(item)  # function_call, reasoning, etc. — never touch
+    return new_items, saved_total
 
 # ─── Lifespan ──────────────────────────────────────────────────────────────────
 
@@ -1281,6 +1324,31 @@ async def proxy(request: Request, path: str):
                     if total_saved > 0:
                         payload["messages"] = new_messages
 
+                # Responses API: input (string or item list) + instructions
+                elif path == "v1/responses":
+                    inp = payload.get("input")
+                    if isinstance(inp, list):
+                        new_items, saved = _compress_responses_items(inp, skipped)
+                        messages_total = len(inp)
+                        total_saved += saved
+                        messages_compressed = sum(1 for a, b in zip(inp, new_items) if json.dumps(a) != json.dumps(b))
+                        if saved > 0:
+                            payload["input"] = new_items
+                    elif isinstance(inp, str) and len(inp) > 200 and _classify_message(inp, "user") == "compressible":
+                        recovery_handle = _recovery_store(inp)
+                        compressed = _compress_for_role(inp, "user")
+                        if len(compressed) < len(inp):
+                            payload["input"] = compressed + f"\n[ccr:{recovery_handle}]"
+                            total_saved = len(inp) - len(payload["input"])
+                            messages_compressed = 1
+                            messages_total = 1
+                    instr = payload.get("instructions")
+                    if isinstance(instr, str) and len(instr) > 400:
+                        compressed = _compress_text(instr)
+                        if len(compressed) < len(instr):
+                            payload["instructions"] = compressed
+                            total_saved += len(instr) - len(compressed)
+
                 # Compress the tools/functions arrays (reshipped on every request)
                 for key in ("tools", "functions"):
                     items = payload.get(key)
@@ -1342,8 +1410,8 @@ async def proxy(request: Request, path: str):
         _cleanup_ctx = not is_sse
         is_streaming = is_sse
 
-        # ── Record stats (chat/completions only) ────────────────────────
-        if path == "v1/chat/completions":
+        # ── Record stats (chat/completions + responses) ─────────────────
+        if path in ("v1/chat/completions", "v1/responses"):
             ratio = ((original_size - compressed_size) / original_size * 100) if original_size > 0 else 0
             REQUEST_STATS.append({
                 "timestamp": time.time(),
@@ -1390,18 +1458,23 @@ async def proxy(request: Request, path: str):
                                         continue
                                     if isinstance(evt.get("usage"), dict):
                                         captured_usage.update(evt["usage"])
+                                    # Responses SSE: usage nested in response.completed
+                                    resp = evt.get("response")
+                                    if isinstance(resp, dict) and isinstance(resp.get("usage"), dict):
+                                        captured_usage.update(resp["usage"])
                                     if "cost" in evt and captured_cost is None:
                                         captured_cost = evt.get("cost")
                         yield chunk
                 finally:
                     await upstream.aclose()
                     await upstream_ctx.__aexit__(None, None, None)
-                    if path == "v1/chat/completions":
+                    if path in ("v1/chat/completions", "v1/responses"):
                         entry = _find_entry(req_id)
                         if entry is not None:
                             if captured_usage:
                                 entry["upstream_usage"] = captured_usage
-                                entry["upstream_prompt_tokens"] = captured_usage.get("prompt_tokens")
+                                entry["upstream_prompt_tokens"] = captured_usage.get(
+                                    "prompt_tokens") or captured_usage.get("input_tokens")
                             if captured_cost is not None:
                                 entry["upstream_cost"] = captured_cost
 
@@ -1418,7 +1491,7 @@ async def proxy(request: Request, path: str):
         else:
             try:
                 resp_body = await upstream.aread()
-                if path == "v1/chat/completions":
+                if path in ("v1/chat/completions", "v1/responses"):
                     entry = _find_entry(req_id)
                     if entry is not None:
                         try:
@@ -1426,9 +1499,13 @@ async def proxy(request: Request, path: str):
                         except (json.JSONDecodeError, ValueError):
                             resp_json = None
                         if isinstance(resp_json, dict):
-                            if isinstance(resp_json.get("usage"), dict):
-                                entry["upstream_usage"] = resp_json["usage"]
-                                entry["upstream_prompt_tokens"] = resp_json["usage"].get("prompt_tokens")
+                            usage = resp_json.get("usage")
+                            if not isinstance(usage, dict) and isinstance(resp_json.get("response"), dict):
+                                usage = resp_json["response"].get("usage")
+                            if isinstance(usage, dict):
+                                entry["upstream_usage"] = usage
+                                entry["upstream_prompt_tokens"] = usage.get(
+                                    "prompt_tokens") or usage.get("input_tokens")
                             if "cost" in resp_json:
                                 entry["upstream_cost"] = resp_json.get("cost")
             finally:

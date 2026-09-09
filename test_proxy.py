@@ -223,6 +223,77 @@ class ProxyEndToEndTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(upstream.last["content"], b"not json at all")
 
+    def test_responses_api_flat_tools_and_input_compressed(self):
+        big_json = json.dumps({"rows": [{"d": "q" * 4000} for _ in range(8)]})
+        payload = {
+            "model": "test",
+            "instructions": "I" * 800,
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "U" * 1500}]},
+                {"type": "function_call", "call_id": "c1", "name": "fetch",
+                 "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": big_json},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "go"}]},
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "fetch",
+                "description": "x" * 500,
+                "parameters": {"type": "object", "properties": {
+                    "q": {"type": "string", "description": "y" * 300}}},
+            }],
+        }
+        upstream = _FakeUpstream(_resp(b'{"usage": {"input_tokens": 42}}'))
+        with TestClient(proxy.app) as client:
+            proxy._http = upstream
+            r = client.post("/v1/responses", json=payload)
+        self.assertEqual(r.status_code, 200)
+        sent = json.loads(upstream.last["content"])
+        # flat tools stay flat, description trimmed, schema compressed
+        tool = sent["tools"][0]
+        self.assertEqual(tool["name"], "fetch")
+        self.assertLess(len(tool["description"]), 130)
+        self.assertLess(len(json.dumps(tool["parameters"])),
+                        len(json.dumps(payload["tools"][0]["parameters"])))
+        # big function_call_output compressed + recovery handle
+        outs = [i for i in sent["input"] if i.get("type") == "function_call_output"]
+        self.assertEqual(len(outs), 1)
+        self.assertLess(len(outs[0]["output"]), len(big_json))
+        self.assertIn("[ccr:", outs[0]["output"])
+        # function_call + small messages untouched
+        self.assertIn({"type": "function_call", "call_id": "c1", "name": "fetch",
+                       "arguments": "{}"}, sent["input"])
+        # stats recorded for responses path
+        entry = proxy.REQUEST_STATS[-1]
+        self.assertEqual(entry["path"], "v1/responses")
+        self.assertGreater(entry["chars_saved"], 0)
+        self.assertEqual(entry["upstream_prompt_tokens"], 42)
+
+    def test_responses_api_reasoning_never_touched(self):
+        reasoning = {"type": "reasoning", "summary": [{"type": "summary_text",
+                                                      "text": "R" * 2000}]}
+        payload = {"model": "test", "input": [reasoning]}
+        upstream = _FakeUpstream(_resp(b'{"usage": {"input_tokens": 1}}'))
+        with TestClient(proxy.app) as client:
+            proxy._http = upstream
+            r = client.post("/v1/responses", json=payload)
+        self.assertEqual(r.status_code, 200)
+        sent = json.loads(upstream.last["content"])
+        self.assertEqual(sent["input"][0], reasoning)
+
+    def test_responses_api_string_input_compressed(self):
+        payload = {"model": "test", "input": "hello world " * 300}
+        upstream = _FakeUpstream(_resp(b'{"usage": {"input_tokens": 1}}'))
+        with TestClient(proxy.app) as client:
+            proxy._http = upstream
+            r = client.post("/v1/responses", json=payload)
+        self.assertEqual(r.status_code, 200)
+        sent = json.loads(upstream.last["content"])
+        self.assertLess(len(sent["input"]), len(payload["input"]))
+        self.assertIn("[ccr:", sent["input"])
+
 
 if __name__ == "__main__":
     unittest.main()
