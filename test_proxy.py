@@ -1,4 +1,4 @@
-"""Tests for hermes-proxy compression (tools array, structural JSON, skip counters).
+"""Tests for opencode-tk-proxy compression (tools array, structural JSON, skip counters).
 
 Run: ~/.hermes/hermes-agent/venv/bin/python -m unittest -v test_proxy
 """

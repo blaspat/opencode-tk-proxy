@@ -5,10 +5,10 @@ After=network.target
 [Service]
 Type=simple
 User=patrick
-WorkingDirectory=/home/patrick/.hermes/artifacts/claire/hermes-proxy
+WorkingDirectory=/home/patrick/.hermes/artifacts/claire/opencode-tk-proxy
 Environment=VERBOSE=true
 Environment=COMPRESS=true
-ExecStart=/home/patrick/.hermes/hermes-agent/venv/bin/python3 /home/patrick/.hermes/artifacts/claire/hermes-proxy/proxy.py
+ExecStart=/home/patrick/.hermes/hermes-agent/venv/bin/python3 /home/patrick/.hermes/artifacts/claire/opencode-tk-proxy/proxy.py
 Restart=always
 RestartSec=5
 StandardOutput=journal

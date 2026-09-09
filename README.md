@@ -25,8 +25,8 @@ An OpenAI-compatible proxy for Hermes Agent that sits between Hermes and LLM pro
 
 ```bash
 # Clone the repo
-git clone https://github.com/blaspat/hermes-proxy.git
-cd hermes-proxy
+git clone https://github.com/blaspat/opencode-tk-proxy.git
+cd opencode-tk-proxy
 
 # Install dependencies
 pip install fastapi uvicorn httpx python-dotenv
@@ -93,7 +93,7 @@ Add a provider in `opencode.json`:
 ```json
 {
   "provider": {
-    "hermes-proxy": {
+    "opencode-tk-proxy": {
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "baseURL": "http://127.0.0.1:8787/v1",
@@ -101,7 +101,7 @@ Add a provider in `opencode.json`:
       }
     }
   },
-  "model": "hermes-proxy/mimo-v2.5"
+  "model": "opencode-tk-proxy/mimo-v2.5"
 }
 ```
 
@@ -115,10 +115,10 @@ Notes:
 ## Install as Service
 
 ```bash
-sudo cp hermes-proxy.service /etc/systemd/system/
+sudo cp opencode-tk-proxy.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable hermes-proxy
-sudo systemctl start hermes-proxy
+sudo systemctl enable opencode-tk-proxy
+sudo systemctl start opencode-tk-proxy
 ```
 
 ## Compression Ratios

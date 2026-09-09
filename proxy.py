@@ -46,11 +46,11 @@ SESSION_ID = os.getenv("SESSION_ID", "")
 if not SESSION_ID and UPSTREAM_KEY:
     SESSION_ID = hashlib.sha256(UPSTREAM_KEY.encode()).hexdigest()[:16]
 elif not SESSION_ID:
-    SESSION_ID = "hermes-proxy"
+    SESSION_ID = "opencode-tk-proxy"
 
 # ─── Recovery Store (SQLite) ─────────────────────────────────────────────────
 
-_RECOVERY_DB = "/tmp/hermes-proxy-recovery.db"
+_RECOVERY_DB = "/tmp/opencode-tk-proxy-recovery.db"
 _recovery_local = threading.local()
 
 def _get_recovery_conn() -> sqlite3.Connection:
@@ -179,7 +179,7 @@ logging.basicConfig(
     level=logging.DEBUG if VERBOSE else logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
-log = logging.getLogger("hermes-proxy")
+log = logging.getLogger("opencode-tk-proxy")
 
 # ─── Classifier (inlined from context-bridge/classifier.py) ───────────────────
 
