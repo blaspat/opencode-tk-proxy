@@ -140,6 +140,47 @@ strings are trimmed).
 
 Production average on live traffic (`/stats` `avg_compression_ratio`): ~43%.
 
+## Install as systemd Service
+
+```bash
+# Clone the repo
+git clone https://github.com/blaspat/hermes-proxy.git
+cd hermes-proxy
+
+# Create a .env file with your config
+cat > .env <<EOF
+UPSTREAM_URL=https://your-llm-provider.com/v1
+UPSTREAM_KEY=sk-your-api-key
+PROXY_PORT=8787
+EOF
+
+# Create the service file
+sudo tee /etc/systemd/system/hermes-proxy.service > /dev/null <<EOF
+[Unit]
+Description=Hermes LLM Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=$(whoami)
+WorkingDirectory=$(pwd)
+ExecStart=$(which python3) $(pwd)/proxy.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable hermes-proxy
+sudo systemctl start hermes-proxy
+
+# Check status
+sudo systemctl status hermes-proxy
+```
+
 ## License
 
 MIT
