@@ -123,15 +123,22 @@ sudo systemctl start hermes-proxy
 
 ## Compression Ratios
 
-Typical compression ratios based on content type:
+Measured on the proxy's own tests (N=5 A/B harness + real recovery-store
+traffic, Sep 2026). Compression acts on the request **input only** — never
+responses; tool definitions are never removed (only long `description`
+strings are trimmed).
 
-| Content Type | Average Savings |
+| Content type | Measured savings |
 |-------------|-----------------|
-| System prompts | 40-50% |
-| Terminal output | 50-70% |
-| Log files | 30-50% |
-| Tool schemas | 20-30% |
-| HTML content | 60-80% |
+| Chat + tool-result JSON (real traffic) | ~50-65% (whole real chat payload 54.5%) |
+| Git / diff output | ~48% |
+| Documentation text | ~49% |
+| Log files | ~42% |
+| Shell / terminal output | ~44% |
+| Tool schemas (description strings only) | ~25% |
+| Short prose (<100 chars) / verbatim code | 0% — untouched by design |
+
+Production average on live traffic (`/stats` `avg_compression_ratio`): ~43%.
 
 ## License
 
