@@ -38,7 +38,7 @@ pip install -r requirements.txt
 # Create .env file
 cat > .env << 'EOF'
 UPSTREAM_URL=https://opencode.ai/zen/go
-UPSTREAM_KEY=your-api-key-here
+UPSTREAM_KEY=
 PROXY_PORT=8787
 SESSION_ID=
 VERBOSE=true
@@ -70,18 +70,12 @@ python3 proxy.py
 
 ## Usage with Hermes
 
-Configure your Hermes profile to use the proxy:
-
-```yaml
-# config.yaml
-model:
-  provider: custom
-```
+Configure your Hermes profile to use the proxy by overriding the `OPENCODE_GO_BASE_URL` or `OPENCODE_ZEN_BASE_URL`:
 
 ```bash
 # .env
-CUSTOM_BASE_URL=http://127.0.0.1:8787/v1
-CUSTOM_API_KEY=your-api-key
+OPENCODE_GO_BASE_URL=http://127.0.0.1:8787/v1
+OPENCODE_ZEN_BASE_URL=http://127.0.0.1:8787/v1
 ```
 
 ## Use from the opencode CLI
@@ -96,16 +90,14 @@ Add a provider in `opencode.json`:
 
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "opencode-tk-proxy": {
-      "npm": "@ai-sdk/openai-compatible",
+    "opencode-go": {
       "options": {
-        "baseURL": "http://127.0.0.1:8787/v1",
-        "apiKey": "***"
+        "baseURL": "http://127.0.0.1:8787/v1"
       }
     }
-  },
-  "model": "opencode-tk-proxy/mimo-v2.5"
+  }
 }
 ```
 
@@ -161,7 +153,7 @@ pip install -r requirements.txt
 # Create a .env file with your config
 cat > .env <<EOF
 UPSTREAM_URL=https://your-llm-provider.com/v1
-UPSTREAM_KEY=sk-your-api-key
+UPSTREAM_KEY=
 PROXY_PORT=8787
 EOF
 
