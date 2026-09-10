@@ -15,6 +15,7 @@ Env:
 
 import os
 import hashlib
+from collections import Counter
 import re
 import json
 import time
@@ -1216,6 +1217,131 @@ def _compress_responses_items(items: list, skipped: dict | None = None, query: s
             new_items.append(item)  # function_call, reasoning, etc. — never touch
     return new_items, saved_total
 
+
+# ─── Anthropic Messages API (POST /v1/messages) ────────────────────────────────
+
+_ANTHROPIC_BLOCK_RE = re.compile(r"tool_result|tool_use|thinking")
+
+
+def _is_anthropic_payload(payload: dict, path: str) -> bool:
+    """Anthropic /v1/messages: messages with tool_result/tool_use/thinking content blocks."""
+    if path not in ("v1/messages", "messages"):
+        return False
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list):
+        return False
+    for msg in msgs:
+        if not isinstance(msg, dict) or not isinstance(msg.get("content"), list):
+            continue
+        for p in msg["content"]:
+            if isinstance(p, dict) and _ANTHROPIC_BLOCK_RE.search(str(p.get("type", ""))):
+                return True
+    return False
+
+
+def _compress_anthropic_message(msg: dict, skipped: dict | None, query: str | None,
+                                msg_age: int) -> tuple[dict, int]:
+    """Compress one Anthropic /v1/messages message.
+
+    - tool_result blocks (string or content-list) → synthetic tool message
+      through the full result-compressor + recovery path.
+    - text parts → role-based compression.
+    - tool_use / thinking blocks are NEVER touched.
+    """
+    role = msg.get("role", "user")
+    content = msg.get("content")
+    new_parts = []
+    saved_total = 0
+
+    if isinstance(content, str):
+        text = content
+        if role == "user":
+            # User text: compress if large (conversation history user turns)
+            compressed = _compress_for_role(text, role, query, msg_age)
+            saved = len(text) - len(compressed)
+            if saved > 0:
+                handle = _recovery_store(text)
+                saved -= len(f"\n[ccr:{handle}]")
+                if saved > 0:
+                    return dict(msg, content=compressed + f"\n[ccr:{handle}]"), saved
+        return msg, 0
+
+    if not isinstance(content, list):
+        return msg, 0
+
+    for p in content:
+        if not isinstance(p, dict):
+            new_parts.append(p)
+            continue
+        ptype = p.get("type", "")
+        if ptype == "tool_result":
+            inner = p.get("content")
+            if isinstance(inner, str):
+                synthetic = {"role": "tool", "content": inner}
+                comp_msg, saved = _try_compress_message(synthetic, skipped, query, msg_age)
+                if saved > 0:
+                    saved_total += saved
+                    p = dict(p, content=comp_msg["content"])
+            elif isinstance(inner, list):
+                compressed_inner = []
+                for ip in inner:
+                    if isinstance(ip, dict) and ip.get("type") == "text":
+                        t = ip.get("text", "")
+                        if len(t) > 200:
+                            c = _compress_for_role(t, "tool", query, msg_age)
+                            if len(c) < len(t):
+                                saved_total += len(t) - len(c)
+                                compressed_inner.append(dict(ip, text=c))
+                                continue
+                    compressed_inner.append(ip)
+                if any(a is not b for a, b in zip(inner, compressed_inner)):
+                    p = dict(p, content=compressed_inner)
+        elif ptype == "text":
+            t = p.get("text", "")
+            if len(t) > 200 and role != "assistant":
+                c = _compress_for_role(t, role, query, msg_age)
+                if len(c) < len(t):
+                    saved_total += len(t) - len(c)
+                    p = dict(p, text=c)
+        # tool_use, thinking, image, document, etc. — never touch
+        new_parts.append(p)
+
+    if saved_total <= 0:
+        return msg, 0
+    if skipped is not None and not any(
+        isinstance(p, dict) and p.get("type") == "tool_result" for p in new_parts):
+        pass  # keep counters simple; skip reasons already accumulated per block
+    return dict(msg, content=new_parts), saved_total
+
+
+def _compress_anthropic_messages(payload: dict, skipped: dict | None,
+                                 query: str | None) -> tuple[int, int, int]:
+    """Compress an Anthropic /v1/messages payload in place.
+    Returns (total_saved, messages_compressed, messages_total)."""
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return 0, 0, 0
+    total_saved = 0
+    count = 0
+    n = len(messages)
+    new_messages = []
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            new_messages.append(msg)
+            continue
+        comp_msg, saved = _compress_anthropic_message(msg, skipped, query, n - 1 - idx)
+        total_saved += saved
+        if saved > 0:
+            count += 1
+        new_messages.append(comp_msg)
+    if isinstance(payload.get("system"), str) and len(payload["system"]) > 200:
+        c = _compress_system_prompt(payload["system"])
+        if len(c) < len(payload["system"]):
+            total_saved += len(payload["system"]) - len(c)
+            payload["system"] = c
+    payload["messages"] = new_messages
+    return total_saved, count, n
+
 # ─── Lifespan ──────────────────────────────────────────────────────────────────
 
 _http: httpx.AsyncClient | None = None
@@ -1256,6 +1382,7 @@ async def stats():
             skipped_totals[k] = skipped_totals.get(k, 0) + v
     return {
         "total_requests": total_requests,
+        "requests_by_path": dict(Counter(e["path"] for e in entries)),
         "total_chars_saved": total_chars_saved,
         "avg_compression_ratio": round(avg_ratio, 1),
         "recent": entries[-20:],
@@ -1342,22 +1469,26 @@ async def proxy(request: Request, path: str):
             payload = json.loads(body)
             if isinstance(payload, dict):
                 query = _extract_query(payload)
-                messages = payload.get("messages")
-                if isinstance(messages, list):
-                    messages_total = len(messages)
-                    new_messages = []
-                    n = len(messages)
-                    for idx, msg in enumerate(messages):
-                        compressed_msg, saved = _try_compress_message(msg, skipped, query, n - 1 - idx)
-                        total_saved += saved
-                        if saved > 0:
-                            messages_compressed += 1
-                        new_messages.append(compressed_msg)
-                    if total_saved > 0:
-                        payload["messages"] = new_messages
+                if _is_anthropic_payload(payload, path):
+                    total_saved, messages_compressed, messages_total = \
+                        _compress_anthropic_messages(payload, skipped, query)
+                else:
+                    messages = payload.get("messages")
+                    if isinstance(messages, list):
+                        messages_total = len(messages)
+                        new_messages = []
+                        n = len(messages)
+                        for idx, msg in enumerate(messages):
+                            compressed_msg, saved = _try_compress_message(msg, skipped, query, n - 1 - idx)
+                            total_saved += saved
+                            if saved > 0:
+                                messages_compressed += 1
+                            new_messages.append(compressed_msg)
+                        if total_saved > 0:
+                            payload["messages"] = new_messages
 
-                # Responses API: input (string or item list) + instructions
-                elif path == "v1/responses":
+                if path == "v1/responses":
+                    # Responses API: input (string or item list) + instructions
                     inp = payload.get("input")
                     if isinstance(inp, list):
                         new_items, saved = _compress_responses_items(inp, skipped, query, messages_total)
@@ -1442,8 +1573,8 @@ async def proxy(request: Request, path: str):
         _cleanup_ctx = not is_sse
         is_streaming = is_sse
 
-        # ── Record stats (chat/completions + responses) ─────────────────
-        if path in ("v1/chat/completions", "v1/responses"):
+        # ── Record stats (chat/completions, responses, anthropic messages) ──
+        if path in ("v1/chat/completions", "v1/responses", "v1/messages"):
             ratio = ((original_size - compressed_size) / original_size * 100) if original_size > 0 else 0
             REQUEST_STATS.append({
                 "timestamp": time.time(),
