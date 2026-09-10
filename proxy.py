@@ -186,21 +186,57 @@ logging.basicConfig(
 log = logging.getLogger("opencode-tk-proxy")
 
 def _extract_query(payload: dict) -> str | None:
-    """Latest user message text (compressed first) — query anchor for tool results."""
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        return None
-    for msg in reversed(messages):
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            c = msg.get("content")
-            if isinstance(c, str) and len(c) >= 20:
-                return c[:500]
-            if isinstance(c, list):
-                text = " ".join(p.get("text", "") for p in c
-                                if isinstance(p, dict) and p.get("type") in ("text", "input_text"))
+    """Latest user text from Chat/Responses input for query-aware compression."""
+    sequences = [payload.get("messages"), payload.get("input")]
+    for items in sequences:
+        if isinstance(items, str) and len(items) >= 20:
+            return items[:500]
+        if not isinstance(items, list):
+            continue
+        for item in reversed(items):
+            if not isinstance(item, dict) or item.get("role") != "user":
+                continue
+            content = item.get("content")
+            if isinstance(content, str) and len(content) >= 20:
+                return content[:500]
+            if isinstance(content, list):
+                text = " ".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") in ("text", "input_text")
+                )
                 if len(text) >= 20:
                     return text[:500]
     return None
+
+
+def _canonical_path(path: str) -> str:
+    """Normalize a routed API path without changing its upstream endpoint name."""
+    return path.rstrip("/")
+
+
+def _upstream_url(path: str, query: str = "") -> str:
+    """Join an upstream base and API path without duplicating the /v1 prefix."""
+    base = UPSTREAM_URL.rstrip("/")
+    if base.endswith("/v1") and (path == "v1" or path.startswith("v1/")):
+        base = base[:-3]
+    url = f"{base}/{path}"
+    return f"{url}?{query}" if query else url
+
+
+def _compress_recoverable_text(text: str, role: str, query: str | None = None,
+                               msg_age: int = 0) -> tuple[str, int]:
+    """Compress one text block and retain its original behind a recovery marker."""
+    if not text or len(text) <= 200:
+        return text, 0
+    label = _classify_message(text, role)
+    if label != "compressible" and not (role == "tool" and _maybe_json_content(text)):
+        return text, 0
+    compressed = _compress_for_role(text, role, query, msg_age)
+    handle = _recovery_store(text)
+    marker = f"\n[ccr:{handle}]"
+    if len(compressed) + len(marker) >= len(text):
+        return text, 0
+    return compressed + marker, len(text) - len(compressed) - len(marker)
 
 
 # ─── Classifier (inlined from context-bridge/classifier.py) ───────────────────
@@ -1167,11 +1203,15 @@ def _try_compress_message(msg: dict, skipped: dict | None = None, query: str | N
             if skipped is not None:
                 skipped["no_saving"] = skipped.get("no_saving", 0) + 1
             return msg, 0
-        # Append recovery handle to last text part
-        if new_parts and isinstance(new_parts[-1], dict) and new_parts[-1].get("type") == "text":
-            handle_text = new_parts[-1].get("text", "")
-            new_parts[-1] = dict(new_parts[-1], text=handle_text + f"\n[ccr:{recovery_handle}]")
-            total_saved -= len(f"\n[ccr:{recovery_handle}]")
+        # Append recovery handle to the last text-bearing part
+        for part_idx in range(len(new_parts) - 1, -1, -1):
+            part = new_parts[part_idx]
+            if isinstance(part, dict) and part.get("type") in ("text", "input_text"):
+                handle_text = part.get("text", "")
+                marker = f"\n[ccr:{recovery_handle}]"
+                new_parts[part_idx] = dict(part, text=handle_text + marker)
+                total_saved -= len(marker)
+                break
         new_msg["content"] = new_parts
         saved = total_saved
     else:
@@ -1197,7 +1237,7 @@ def _compress_responses_items(items: list, skipped: dict | None = None, query: s
         itype = item.get("type")
         if itype in (None, "message"):
             # EasyInputMessage / Message: role + content — same shape as chat
-            msg, saved = _try_compress_message(item, skipped, None, len(items) - 1 - idx)
+            msg, saved = _try_compress_message(item, skipped, query, len(items) - 1 - idx)
             saved_total += saved
             new_items.append(msg)
         elif itype == "function_call_output":
@@ -1286,23 +1326,22 @@ def _compress_anthropic_message(msg: dict, skipped: dict | None, query: str | No
                 compressed_inner = []
                 for ip in inner:
                     if isinstance(ip, dict) and ip.get("type") == "text":
-                        t = ip.get("text", "")
-                        if len(t) > 200:
-                            c = _compress_for_role(t, "tool", query, msg_age)
-                            if len(c) < len(t):
-                                saved_total += len(t) - len(c)
-                                compressed_inner.append(dict(ip, text=c))
-                                continue
+                        text, saved = _compress_recoverable_text(
+                            ip.get("text", ""), "tool", query, msg_age)
+                        if saved > 0:
+                            saved_total += saved
+                            compressed_inner.append(dict(ip, text=text))
+                            continue
                     compressed_inner.append(ip)
                 if any(a is not b for a, b in zip(inner, compressed_inner)):
                     p = dict(p, content=compressed_inner)
         elif ptype == "text":
-            t = p.get("text", "")
-            if len(t) > 200 and role != "assistant":
-                c = _compress_for_role(t, role, query, msg_age)
-                if len(c) < len(t):
-                    saved_total += len(t) - len(c)
-                    p = dict(p, text=c)
+            if role != "assistant":
+                text, saved = _compress_recoverable_text(
+                    p.get("text", ""), role, query, msg_age)
+                if saved > 0:
+                    saved_total += saved
+                    p = dict(p, text=text)
         # tool_use, thinking, image, document, etc. — never touch
         new_parts.append(p)
 
@@ -1334,11 +1373,11 @@ def _compress_anthropic_messages(payload: dict, skipped: dict | None,
         if saved > 0:
             count += 1
         new_messages.append(comp_msg)
-    if isinstance(payload.get("system"), str) and len(payload["system"]) > 200:
-        c = _compress_system_prompt(payload["system"])
-        if len(c) < len(payload["system"]):
-            total_saved += len(payload["system"]) - len(c)
-            payload["system"] = c
+    if isinstance(payload.get("system"), str):
+        text, saved = _compress_recoverable_text(payload["system"], "system", query)
+        if saved > 0:
+            total_saved += saved
+            payload["system"] = text
     payload["messages"] = new_messages
     return total_saved, count, n
 
@@ -1423,6 +1462,7 @@ async def dashboard():
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(request: Request, path: str):
     """Catch-all: forward to upstream with x-opencode-session injection + compression."""
+    path = _canonical_path(path)
     # Fix #4: Reject path traversal attempts
     if ".." in path.split("/"):
         return Response(
@@ -1431,9 +1471,7 @@ async def proxy(request: Request, path: str):
             media_type="application/json",
         )
 
-    url = f"{UPSTREAM_URL}/{path}"
-    if request.url.query:
-        url += f"?{request.url.query}"
+    url = _upstream_url(path, request.url.query)
 
     headers = dict(request.headers)
     for h in ("host", "transfer-encoding", "connection", "content-length"):
@@ -1444,11 +1482,9 @@ async def proxy(request: Request, path: str):
         headers["x-opencode-session"] = SESSION_ID
         log.debug("Injected x-opencode-session: %s", SESSION_ID[:8] + "...")
 
-    # Fix #2: Silently override Authorization (no info-leaking log about UPSTREAM_KEY)
-    if UPSTREAM_KEY:
-        if "authorization" not in headers_lower:
-            log.debug("Injected Authorization header")
+    if UPSTREAM_KEY and "authorization" not in headers_lower:
         headers["authorization"] = f"Bearer {UPSTREAM_KEY}"
+        log.debug("Injected Authorization header")
 
     body = await request.body()
     original_body = body
@@ -1497,20 +1533,19 @@ async def proxy(request: Request, path: str):
                         messages_compressed = sum(1 for a, b in zip(inp, new_items) if json.dumps(a) != json.dumps(b))
                         if saved > 0:
                             payload["input"] = new_items
-                    elif isinstance(inp, str) and len(inp) > 200 and _classify_message(inp, "user") == "compressible":
-                        recovery_handle = _recovery_store(inp)
-                        compressed = _compress_for_role(inp, "user")
-                        if len(compressed) < len(inp):
-                            payload["input"] = compressed + f"\n[ccr:{recovery_handle}]"
-                            total_saved = len(inp) - len(payload["input"])
+                    elif isinstance(inp, str):
+                        compressed, saved = _compress_recoverable_text(inp, "user", query)
+                        if saved > 0:
+                            payload["input"] = compressed
+                            total_saved += saved
                             messages_compressed = 1
                             messages_total = 1
                     instr = payload.get("instructions")
-                    if isinstance(instr, str) and len(instr) > 400:
-                        compressed = _compress_text(instr)
-                        if len(compressed) < len(instr):
+                    if isinstance(instr, str):
+                        compressed, saved = _compress_recoverable_text(instr, "system", query)
+                        if saved > 0:
                             payload["instructions"] = compressed
-                            total_saved += len(instr) - len(compressed)
+                            total_saved += saved
 
                 # Compress the tools/functions arrays (reshipped on every request)
                 for key in ("tools", "functions"):
@@ -1621,17 +1656,17 @@ async def proxy(request: Request, path: str):
                                         continue
                                     if isinstance(evt.get("usage"), dict):
                                         captured_usage.update(evt["usage"])
-                                    # Responses SSE: usage nested in response.completed
-                                    resp = evt.get("response")
-                                    if isinstance(resp, dict) and isinstance(resp.get("usage"), dict):
-                                        captured_usage.update(resp["usage"])
+                                    for container_key in ("response", "message", "delta"):
+                                        container = evt.get(container_key)
+                                        if isinstance(container, dict) and isinstance(container.get("usage"), dict):
+                                            captured_usage.update(container["usage"])
                                     if "cost" in evt and captured_cost is None:
                                         captured_cost = evt.get("cost")
                         yield chunk
                 finally:
                     await upstream.aclose()
                     await upstream_ctx.__aexit__(None, None, None)
-                    if path in ("v1/chat/completions", "v1/responses"):
+                    if path in ("v1/chat/completions", "v1/responses", "v1/messages"):
                         entry = _find_entry(req_id)
                         if entry is not None:
                             if captured_usage:
@@ -1654,7 +1689,7 @@ async def proxy(request: Request, path: str):
         else:
             try:
                 resp_body = await upstream.aread()
-                if path in ("v1/chat/completions", "v1/responses"):
+                if path in ("v1/chat/completions", "v1/responses", "v1/messages"):
                     entry = _find_entry(req_id)
                     if entry is not None:
                         try:
