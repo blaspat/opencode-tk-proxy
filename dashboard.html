@@ -39,6 +39,7 @@
 
 <div class="summary">
   <div class="card"><div class="label">Total Requests</div><div class="value" id="total-requests">—</div></div>
+  <div class="card"><div class="label">By Endpoint</div><div class="value blue" id="by-endpoint" style="font-size:14px">—</div></div>
   <div class="card"><div class="label">Total Chars Saved</div><div class="value green" id="total-saved">—</div></div>
   <div class="card"><div class="label">Avg Compression Ratio</div><div class="value blue" id="avg-ratio">—</div></div>
   <div class="card"><div class="label">Tokens Saved (est)</div><div class="value green" id="tokens-saved">—</div></div>
@@ -76,6 +77,8 @@ async function refresh() {
     const r = await fetch('/stats');
     const d = await r.json();
     document.getElementById('total-requests').textContent = d.total_requests;
+    document.getElementById('by-endpoint').textContent =
+      Object.entries(d.requests_by_path || {}).map(([p, c]) => p.replace(/^v1\//, '') + ': ' + c).join(' · ') || '—';
     document.getElementById('total-saved').textContent = fmt(d.total_chars_saved) + ' chars';
     document.getElementById('avg-ratio').textContent = d.avg_compression_ratio + '%';
     document.getElementById('tokens-saved').textContent = fmt(d.tokens_est_saved_total || 0);

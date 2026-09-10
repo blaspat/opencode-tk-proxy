@@ -295,6 +295,69 @@ class ProxyEndToEndTests(unittest.TestCase):
         self.assertIn("[ccr:", sent["input"])
 
 
+    def test_anthropic_messages_compressed_and_stats(self):
+        big_json = {"rows": [{"d": "q" * 3000} for _ in range(6)]}
+        payload = {
+            "model": "claude-test",
+            "system": "S" * 800,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "run the fetch"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "fetch", "input": {}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1",
+                     "content": json.dumps(big_json)}]},
+                {"role": "user", "content": "hi"},
+            ],
+        }
+        upstream = _FakeUpstream(_resp(b'{"ok": true}'))
+        with TestClient(proxy.app) as client:
+            proxy._http = upstream
+            r = client.post("/v1/messages", json=payload)
+        self.assertEqual(r.status_code, 200)
+        sent = json.loads(upstream.last["content"])
+        # tool_result compressed, still parseable JSON + recovery handle
+        part = sent["messages"][2]["content"][0]
+        self.assertLess(len(part["content"]), len(json.dumps(big_json)))
+        parsed, _, _ = part["content"].partition("\n[ccr:")
+        self.assertEqual(len(json.loads(parsed)["rows"]), 6)
+        # tool_use untouched
+        self.assertEqual(sent["messages"][1]["content"],
+                         payload["messages"][1]["content"])
+        # small user message untouched
+        self.assertEqual(sent["messages"][3]["content"], "hi")
+        # stats recorded for /v1/messages
+        entry = proxy.REQUEST_STATS[-1]
+        self.assertEqual(entry["path"], "v1/messages")
+        self.assertGreater(entry["chars_saved"], 0)
+        self.assertGreater(entry["messages_compressed"], 0)
+
+    def test_anthropic_tool_use_never_touched(self):
+        use_block = {"type": "tool_use", "id": "t9", "name": "fetch",
+                     "input": {"q": "x" * 3000}}
+        payload = {"model": "t", "messages": [
+            {"role": "assistant", "content": [use_block, {"type": "text", "text": "a" * 3000}]}]}
+        upstream = _FakeUpstream(_resp(b'{"ok": true}'))
+        with TestClient(proxy.app) as client:
+            proxy._http = upstream
+            client.post("/v1/messages", json=payload)
+        sent = json.loads(upstream.last["content"])
+        self.assertEqual(sent["messages"][0]["content"][0], use_block)
+
+    def test_stats_by_path(self):
+        proxy.REQUEST_STATS.clear()
+        proxy.REQUEST_STATS.append({"path": "v1/chat/completions", "chars_saved": 1, "compression_ratio": 10})
+        proxy.REQUEST_STATS.append({"path": "v1/messages", "chars_saved": 1, "compression_ratio": 10})
+        upstream = _FakeUpstream(_resp(b'{"ok": true}'))
+        with TestClient(proxy.app) as client:
+            proxy._http = upstream
+            client.get("/stats")
+        # no direct json access via TestClient return; call the function
+        import asyncio as _aio
+        s = _aio.run(proxy.stats())
+        self.assertEqual(s["requests_by_path"].get("v1/messages"), 1)
+
     def test_query_aware_compression(self):
         """Latest user message threads through as query anchor for tool results."""
         from proxy import _extract_query
