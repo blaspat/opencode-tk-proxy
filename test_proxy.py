@@ -358,6 +358,106 @@ class ProxyEndToEndTests(unittest.TestCase):
         s = _aio.run(proxy.stats())
         self.assertEqual(s["requests_by_path"].get("v1/messages"), 1)
 
+    def test_forwarding_normalizes_v1_and_preserves_auth(self):
+        old_url, old_key = proxy.UPSTREAM_URL, proxy.UPSTREAM_KEY
+        proxy.UPSTREAM_URL = "https://upstream.example/v1"
+        proxy.UPSTREAM_KEY = "server-key"
+        upstream = _FakeUpstream(_resp())
+        try:
+            with TestClient(proxy.app) as client:
+                proxy._http = upstream
+                response = client.post(
+                    "/v1/responses/", json={"model": "test", "input": []},
+                    headers={"authorization": "Bearer client-key"})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(str(upstream.last["url"]), "https://upstream.example/v1/responses")
+            self.assertEqual(upstream.last["headers"]["authorization"], "Bearer client-key")
+            self.assertEqual(proxy.REQUEST_STATS[-1]["path"], "v1/responses")
+        finally:
+            proxy.UPSTREAM_URL, proxy.UPSTREAM_KEY = old_url, old_key
+
+    def test_missing_auth_gets_upstream_key(self):
+        old_key = proxy.UPSTREAM_KEY
+        proxy.UPSTREAM_KEY = "server-key"
+        upstream = _FakeUpstream(_resp())
+        try:
+            with TestClient(proxy.app) as client:
+                proxy._http = upstream
+                client.post("/v1/messages", json={"model": "test", "messages": []})
+            self.assertEqual(upstream.last["headers"]["authorization"], "Bearer server-key")
+        finally:
+            proxy.UPSTREAM_KEY = old_key
+
+    def test_responses_input_text_gets_recovery_marker(self):
+        original = "\n".join(f"line {i}: output" for i in range(100))
+        payload = {"model": "test", "input": [{
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": original},
+                         {"type": "input_image", "image_url": "data:image/png;base64,AA=="}],
+        }]}
+        upstream = _FakeUpstream(_resp())
+        with TestClient(proxy.app) as client:
+            proxy._http = upstream
+            client.post("/v1/responses", json=payload)
+        sent = json.loads(upstream.last["content"])
+        text = sent["input"][0]["content"][0]["text"]
+        self.assertIn("[ccr:", text)
+        handle = text.rsplit("[ccr:", 1)[1].rstrip("]")
+        self.assertEqual(proxy._recovery_get("ccr_" + handle[4:]), original)
+
+    def test_anthropic_tool_result_list_gets_recovery_marker(self):
+        original = "\n".join(f"line {i}: output" for i in range(100))
+        payload = {"model": "test", "messages": [{
+            "role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": original}
+                ]}
+            ]
+        }]}
+        upstream = _FakeUpstream(_resp())
+        with TestClient(proxy.app) as client:
+            proxy._http = upstream
+            client.post("/v1/messages", json=payload)
+        text = json.loads(upstream.last["content"])["messages"][0]["content"][0]["content"][0]["text"]
+        self.assertIn("[ccr:", text)
+        handle = "ccr_" + text.rsplit("[ccr:", 1)[1].rstrip("]")[4:]
+        self.assertEqual(proxy._recovery_get(handle), original)
+
+    def test_responses_query_reaches_tool_result_compressor(self):
+        output = "\n".join([*(f"noise {i}" for i in range(60)), "retry logic found", *(f"noise2 {i}" for i in range(60))])
+        payload = {"input": [
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "Find the retry logic in worker.py"}]},
+            {"type": "function_call_output", "call_id": "c1", "output": output},
+        ]}
+        query = proxy._extract_query(payload)
+        new_items, saved = proxy._compress_responses_items(payload["input"], {}, query)
+        self.assertIn("retry logic found", new_items[1]["output"])
+        self.assertGreater(saved, 0)
+
+    def test_messages_usage_captured_sync_and_sse(self):
+        body = json.dumps({"usage": {"input_tokens": 42, "output_tokens": 3}, "cost": "0.2"}).encode()
+        upstream = _FakeUpstream(_resp(body))
+        with TestClient(proxy.app) as client:
+            proxy._http = upstream
+            client.post("/v1/messages", json={"model": "test", "messages": []})
+        entry = proxy.REQUEST_STATS[-1]
+        self.assertEqual(entry["upstream_prompt_tokens"], 42)
+        self.assertEqual(entry["upstream_cost"], "0.2")
+
+        events = (
+            b'data: {"type":"message_start","message":{"usage":{"input_tokens":17}}}\n\n'
+            b'data: {"type":"message_delta","usage":{"output_tokens":2}}\n\n'
+        )
+        upstream = _FakeUpstream(_resp(events, ctype="text/event-stream"))
+        with TestClient(proxy.app) as client:
+            proxy._http = upstream
+            response = client.post("/v1/messages", json={"model": "test", "messages": []})
+        self.assertEqual(response.status_code, 200)
+        entry = proxy.REQUEST_STATS[-1]
+        self.assertEqual(entry["upstream_prompt_tokens"], 17)
+        self.assertEqual(entry["upstream_usage"]["output_tokens"], 2)
+
     def test_query_aware_compression(self):
         """Latest user message threads through as query anchor for tool results."""
         from proxy import _extract_query
