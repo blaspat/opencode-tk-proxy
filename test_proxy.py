@@ -295,5 +295,17 @@ class ProxyEndToEndTests(unittest.TestCase):
         self.assertIn("[ccr:", sent["input"])
 
 
+    def test_query_aware_compression(self):
+        """Latest user message threads through as query anchor for tool results."""
+        from proxy import _extract_query
+        payload = {"messages": [
+            {"role": "user", "content": "Find the retry logic in worker.py"},
+            {"role": "tool", "content": "\n".join(f"noise {i}" for i in range(50)) +
+                                       "\nretry logic found at line 42" +
+                                       "\n".join(f"noise2 {i}" for i in range(50))},
+        ]}
+        self.assertIn("retry logic", _extract_query(payload) or "")
+        self.assertIsNone(_extract_query({"messages": [{"role": "user", "content": "hi"}]}))
+
 if __name__ == "__main__":
     unittest.main()
