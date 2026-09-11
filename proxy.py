@@ -224,19 +224,21 @@ def _upstream_url(path: str, query: str = "") -> str:
 
 
 def _compress_recoverable_text(text: str, role: str, query: str | None = None,
-                               msg_age: int = 0) -> tuple[str, int]:
-    """Compress one text block and retain its original behind a recovery marker."""
+                               msg_age: int = 0,
+                               recovery_handles: list[str] | None = None) -> tuple[str, int]:
+    """Compress text and record its recovery handle outside the model prompt."""
     if not text or len(text) <= 200:
         return text, 0
     label = _classify_message(text, role)
     if label != "compressible" and not (role == "tool" and _maybe_json_content(text)):
         return text, 0
     compressed = _compress_for_role(text, role, query, msg_age)
-    handle = _recovery_store(text)
-    marker = f"\n[ccr:{handle}]"
-    if len(compressed) + len(marker) >= len(text):
+    if len(compressed) >= len(text):
         return text, 0
-    return compressed + marker, len(text) - len(compressed) - len(marker)
+    handle = _recovery_store(text)
+    if recovery_handles is not None:
+        recovery_handles.append(handle)
+    return compressed, len(text) - len(compressed)
 
 
 # ─── Classifier (inlined from context-bridge/classifier.py) ───────────────────
@@ -1129,7 +1131,8 @@ def _compress_for_role(text: str, role: str, query: str | None = None, msg_age: 
     return _compress_text(text)
 
 def _try_compress_message(msg: dict, skipped: dict | None = None, query: str | None = None,
-                          msg_age: int = 0) -> tuple[dict, int]:
+                          msg_age: int = 0,
+                          recovery_handles: list[str] | None = None) -> tuple[dict, int]:
     """Try to compress a message. Returns (possibly modified msg, chars saved).
     Stores original content in recovery store before compression.
     `skipped` (optional dict of reason->count) accumulates messages NOT compressed.
@@ -1166,10 +1169,7 @@ def _try_compress_message(msg: dict, skipped: dict | None = None, query: str | N
             skipped["verbatim"] = skipped.get("verbatim", 0) + 1
         return msg, 0
 
-    # Store original in recovery store before lossy compression
-    recovery_handle = _recovery_store(text_content)
-
-    # Fix #3: Build new message — compress each text part individually
+    # Build new message — compress each text part individually
     new_msg = dict(msg)
     if isinstance(content, str):
         compressed = _compress_for_role(content, role, query, msg_age)
@@ -1178,9 +1178,10 @@ def _try_compress_message(msg: dict, skipped: dict | None = None, query: str | N
             if skipped is not None:
                 skipped["no_saving"] = skipped.get("no_saving", 0) + 1
             return msg, 0
-        # Append recovery handle as comment
-        new_msg["content"] = compressed + f"\n[ccr:{recovery_handle}]"
-        saved += len(f"\n[ccr:{recovery_handle}]")
+        handle = _recovery_store(text_content)
+        if recovery_handles is not None:
+            recovery_handles.append(handle)
+        new_msg["content"] = compressed
     elif isinstance(content, list):
         total_saved = 0
         new_parts = []
@@ -1203,25 +1204,19 @@ def _try_compress_message(msg: dict, skipped: dict | None = None, query: str | N
             if skipped is not None:
                 skipped["no_saving"] = skipped.get("no_saving", 0) + 1
             return msg, 0
-        # Append recovery handle to the last text-bearing part
-        for part_idx in range(len(new_parts) - 1, -1, -1):
-            part = new_parts[part_idx]
-            if isinstance(part, dict) and part.get("type") in ("text", "input_text"):
-                handle_text = part.get("text", "")
-                marker = f"\n[ccr:{recovery_handle}]"
-                new_parts[part_idx] = dict(part, text=handle_text + marker)
-                total_saved -= len(marker)
-                break
+        handle = _recovery_store(text_content)
+        if recovery_handles is not None:
+            recovery_handles.append(handle)
         new_msg["content"] = new_parts
-        saved = total_saved
     else:
         return msg, 0
 
-    return new_msg, saved
+    return new_msg, saved if isinstance(content, str) else total_saved
 
 
 def _compress_responses_items(items: list, skipped: dict | None = None, query: str | None = None,
-                              messages_total: int = 0) -> tuple[list, int]:
+                              messages_total: int = 0,
+                              recovery_handles: list[str] | None = None) -> tuple[list, int]:
     """Compress a Responses API `input` item list.
 
     Reusable shapes are mapped onto chat messages and routed through
@@ -1237,7 +1232,8 @@ def _compress_responses_items(items: list, skipped: dict | None = None, query: s
         itype = item.get("type")
         if itype in (None, "message"):
             # EasyInputMessage / Message: role + content — same shape as chat
-            msg, saved = _try_compress_message(item, skipped, query, len(items) - 1 - idx)
+            msg, saved = _try_compress_message(item, skipped, query, len(items) - 1 - idx,
+                                               recovery_handles)
             saved_total += saved
             new_items.append(msg)
         elif itype == "function_call_output":
@@ -1248,7 +1244,8 @@ def _compress_responses_items(items: list, skipped: dict | None = None, query: s
                 json.dumps(output) if output is not None else "")
             synthetic = {"role": "tool", "content": text}
             compressed_msg, saved = _try_compress_message(synthetic, skipped, query,
-                                                          len(items) - 1 - idx)
+                                                          len(items) - 1 - idx,
+                                                          recovery_handles)
             if saved > 0:
                 saved_total += saved
                 item = dict(item, output=compressed_msg["content"])
@@ -1280,7 +1277,8 @@ def _is_anthropic_payload(payload: dict, path: str) -> bool:
 
 
 def _compress_anthropic_message(msg: dict, skipped: dict | None, query: str | None,
-                                msg_age: int) -> tuple[dict, int]:
+                                msg_age: int,
+                                recovery_handles: list[str] | None = None) -> tuple[dict, int]:
     """Compress one Anthropic /v1/messages message.
 
     - tool_result blocks (string or content-list) → synthetic tool message
@@ -1301,9 +1299,9 @@ def _compress_anthropic_message(msg: dict, skipped: dict | None, query: str | No
             saved = len(text) - len(compressed)
             if saved > 0:
                 handle = _recovery_store(text)
-                saved -= len(f"\n[ccr:{handle}]")
-                if saved > 0:
-                    return dict(msg, content=compressed + f"\n[ccr:{handle}]"), saved
+                if recovery_handles is not None:
+                    recovery_handles.append(handle)
+                return dict(msg, content=compressed), saved
         return msg, 0
 
     if not isinstance(content, list):
@@ -1318,7 +1316,8 @@ def _compress_anthropic_message(msg: dict, skipped: dict | None, query: str | No
             inner = p.get("content")
             if isinstance(inner, str):
                 synthetic = {"role": "tool", "content": inner}
-                comp_msg, saved = _try_compress_message(synthetic, skipped, query, msg_age)
+                comp_msg, saved = _try_compress_message(
+                    synthetic, skipped, query, msg_age, recovery_handles)
                 if saved > 0:
                     saved_total += saved
                     p = dict(p, content=comp_msg["content"])
@@ -1327,7 +1326,7 @@ def _compress_anthropic_message(msg: dict, skipped: dict | None, query: str | No
                 for ip in inner:
                     if isinstance(ip, dict) and ip.get("type") == "text":
                         text, saved = _compress_recoverable_text(
-                            ip.get("text", ""), "tool", query, msg_age)
+                            ip.get("text", ""), "tool", query, msg_age, recovery_handles)
                         if saved > 0:
                             saved_total += saved
                             compressed_inner.append(dict(ip, text=text))
@@ -1338,7 +1337,7 @@ def _compress_anthropic_message(msg: dict, skipped: dict | None, query: str | No
         elif ptype == "text":
             if role != "assistant":
                 text, saved = _compress_recoverable_text(
-                    p.get("text", ""), role, query, msg_age)
+                    p.get("text", ""), role, query, msg_age, recovery_handles)
                 if saved > 0:
                     saved_total += saved
                     p = dict(p, text=text)
@@ -1354,7 +1353,8 @@ def _compress_anthropic_message(msg: dict, skipped: dict | None, query: str | No
 
 
 def _compress_anthropic_messages(payload: dict, skipped: dict | None,
-                                 query: str | None) -> tuple[int, int, int]:
+                                 query: str | None,
+                                 recovery_handles: list[str] | None = None) -> tuple[int, int, int]:
     """Compress an Anthropic /v1/messages payload in place.
     Returns (total_saved, messages_compressed, messages_total)."""
     messages = payload.get("messages")
@@ -1368,13 +1368,15 @@ def _compress_anthropic_messages(payload: dict, skipped: dict | None,
         if not isinstance(msg, dict):
             new_messages.append(msg)
             continue
-        comp_msg, saved = _compress_anthropic_message(msg, skipped, query, n - 1 - idx)
+        comp_msg, saved = _compress_anthropic_message(
+            msg, skipped, query, n - 1 - idx, recovery_handles)
         total_saved += saved
         if saved > 0:
             count += 1
         new_messages.append(comp_msg)
     if isinstance(payload.get("system"), str):
-        text, saved = _compress_recoverable_text(payload["system"], "system", query)
+        text, saved = _compress_recoverable_text(
+            payload["system"], "system", query, 0, recovery_handles)
         if saved > 0:
             total_saved += saved
             payload["system"] = text
@@ -1498,6 +1500,7 @@ async def proxy(request: Request, path: str):
     messages_total = 0
     is_streaming = False
     skipped = {"too_small": 0, "tool_calls": 0, "verbatim": 0, "no_saving": 0}
+    recovery_handles: list[str] = []
     tools_compressed = 0
     tools_saved_chars = 0
     if COMPRESS_ENABLED and body and request.method in ("POST", "PUT", "PATCH"):
@@ -1507,7 +1510,7 @@ async def proxy(request: Request, path: str):
                 query = _extract_query(payload)
                 if _is_anthropic_payload(payload, path):
                     total_saved, messages_compressed, messages_total = \
-                        _compress_anthropic_messages(payload, skipped, query)
+                        _compress_anthropic_messages(payload, skipped, query, recovery_handles)
                 else:
                     messages = payload.get("messages")
                     if isinstance(messages, list):
@@ -1515,7 +1518,8 @@ async def proxy(request: Request, path: str):
                         new_messages = []
                         n = len(messages)
                         for idx, msg in enumerate(messages):
-                            compressed_msg, saved = _try_compress_message(msg, skipped, query, n - 1 - idx)
+                            compressed_msg, saved = _try_compress_message(
+                                msg, skipped, query, n - 1 - idx, recovery_handles)
                             total_saved += saved
                             if saved > 0:
                                 messages_compressed += 1
@@ -1527,14 +1531,16 @@ async def proxy(request: Request, path: str):
                     # Responses API: input (string or item list) + instructions
                     inp = payload.get("input")
                     if isinstance(inp, list):
-                        new_items, saved = _compress_responses_items(inp, skipped, query, messages_total)
+                        new_items, saved = _compress_responses_items(
+                            inp, skipped, query, messages_total, recovery_handles)
                         messages_total = len(inp)
                         total_saved += saved
                         messages_compressed = sum(1 for a, b in zip(inp, new_items) if json.dumps(a) != json.dumps(b))
                         if saved > 0:
                             payload["input"] = new_items
                     elif isinstance(inp, str):
-                        compressed, saved = _compress_recoverable_text(inp, "user", query)
+                        compressed, saved = _compress_recoverable_text(
+                            inp, "user", query, 0, recovery_handles)
                         if saved > 0:
                             payload["input"] = compressed
                             total_saved += saved
@@ -1542,7 +1548,8 @@ async def proxy(request: Request, path: str):
                             messages_total = 1
                     instr = payload.get("instructions")
                     if isinstance(instr, str):
-                        compressed, saved = _compress_recoverable_text(instr, "system", query)
+                        compressed, saved = _compress_recoverable_text(
+                            instr, "system", query, 0, recovery_handles)
                         if saved > 0:
                             payload["instructions"] = compressed
                             total_saved += saved
@@ -1627,6 +1634,7 @@ async def proxy(request: Request, path: str):
                 "tools_saved_chars": tools_saved_chars,
                 "streaming": is_streaming,
                 "req_id": req_id,
+                "recovery_handles": recovery_handles,
             })
             if total_saved > 0:
                 asyncio.create_task(_backfill_token_stats(req_id, original_body, body))

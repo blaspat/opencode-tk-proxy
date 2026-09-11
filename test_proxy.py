@@ -115,11 +115,12 @@ class CompressorTests(unittest.TestCase):
         big = {"rows": [{"id": i, "payload": "p" * 3000} for i in range(20)]}
         msg = {"role": "tool", "tool_call_id": "t1", "content": json.dumps(big)}
         skipped = {}
-        out, saved = proxy._try_compress_message(msg, skipped)
+        handles = []
+        out, saved = proxy._try_compress_message(msg, skipped, recovery_handles=handles)
         self.assertGreater(saved, 0)
-        content, _, _ = out["content"].partition("\n[ccr:")
-        parsed = json.loads(content)  # marker appended AFTER valid JSON
+        parsed = json.loads(out["content"])
         self.assertEqual(len(parsed["rows"]), 20)
+        self.assertEqual(proxy._recovery_get(handles[0]), msg["content"])
 
 
 class ProxyEndToEndTests(unittest.TestCase):
@@ -257,11 +258,12 @@ class ProxyEndToEndTests(unittest.TestCase):
         self.assertLess(len(tool["description"]), 130)
         self.assertLess(len(json.dumps(tool["parameters"])),
                         len(json.dumps(payload["tools"][0]["parameters"])))
-        # big function_call_output compressed + recovery handle
+        # big function_call_output compressed without a model-visible recovery marker
         outs = [i for i in sent["input"] if i.get("type") == "function_call_output"]
         self.assertEqual(len(outs), 1)
         self.assertLess(len(outs[0]["output"]), len(big_json))
-        self.assertIn("[ccr:", outs[0]["output"])
+        self.assertNotIn("[ccr:", outs[0]["output"])
+        self.assertNotIn("[ccr:", json.dumps(sent["input"]))
         # function_call + small messages untouched
         self.assertIn({"type": "function_call", "call_id": "c1", "name": "fetch",
                        "arguments": "{}"}, sent["input"])
@@ -292,7 +294,8 @@ class ProxyEndToEndTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         sent = json.loads(upstream.last["content"])
         self.assertLess(len(sent["input"]), len(payload["input"]))
-        self.assertIn("[ccr:", sent["input"])
+        self.assertNotIn("[ccr:", sent["input"])
+        self.assertTrue(proxy.REQUEST_STATS[-1]["recovery_handles"])
 
 
     def test_anthropic_messages_compressed_and_stats(self):
@@ -317,11 +320,11 @@ class ProxyEndToEndTests(unittest.TestCase):
             r = client.post("/v1/messages", json=payload)
         self.assertEqual(r.status_code, 200)
         sent = json.loads(upstream.last["content"])
-        # tool_result compressed, still parseable JSON + recovery handle
+        # tool_result compressed, remains valid JSON without a recovery marker
         part = sent["messages"][2]["content"][0]
         self.assertLess(len(part["content"]), len(json.dumps(big_json)))
-        parsed, _, _ = part["content"].partition("\n[ccr:")
-        self.assertEqual(len(json.loads(parsed)["rows"]), 6)
+        self.assertNotIn("[ccr:", part["content"])
+        self.assertEqual(len(json.loads(part["content"])["rows"]), 6)
         # tool_use untouched
         self.assertEqual(sent["messages"][1]["content"],
                          payload["messages"][1]["content"])
@@ -388,7 +391,7 @@ class ProxyEndToEndTests(unittest.TestCase):
         finally:
             proxy.UPSTREAM_KEY = old_key
 
-    def test_responses_input_text_gets_recovery_marker(self):
+    def test_responses_input_text_hides_recovery_marker(self):
         original = "\n".join(f"line {i}: output" for i in range(100))
         payload = {"model": "test", "input": [{
             "type": "message", "role": "user",
@@ -401,11 +404,12 @@ class ProxyEndToEndTests(unittest.TestCase):
             client.post("/v1/responses", json=payload)
         sent = json.loads(upstream.last["content"])
         text = sent["input"][0]["content"][0]["text"]
-        self.assertIn("[ccr:", text)
-        handle = text.rsplit("[ccr:", 1)[1].rstrip("]")
-        self.assertEqual(proxy._recovery_get("ccr_" + handle[4:]), original)
+        self.assertNotIn("[ccr:", text)
+        handles = proxy.REQUEST_STATS[-1]["recovery_handles"]
+        self.assertEqual(len(handles), 1)
+        self.assertEqual(proxy._recovery_get(handles[0]), original)
 
-    def test_anthropic_tool_result_list_gets_recovery_marker(self):
+    def test_anthropic_tool_result_list_hides_recovery_marker(self):
         original = "\n".join(f"line {i}: output" for i in range(100))
         payload = {"model": "test", "messages": [{
             "role": "user", "content": [
@@ -419,9 +423,10 @@ class ProxyEndToEndTests(unittest.TestCase):
             proxy._http = upstream
             client.post("/v1/messages", json=payload)
         text = json.loads(upstream.last["content"])["messages"][0]["content"][0]["content"][0]["text"]
-        self.assertIn("[ccr:", text)
-        handle = "ccr_" + text.rsplit("[ccr:", 1)[1].rstrip("]")[4:]
-        self.assertEqual(proxy._recovery_get(handle), original)
+        self.assertNotIn("[ccr:", text)
+        handles = proxy.REQUEST_STATS[-1]["recovery_handles"]
+        self.assertEqual(len(handles), 1)
+        self.assertEqual(proxy._recovery_get(handles[0]), original)
 
     def test_responses_query_reaches_tool_result_compressor(self):
         output = "\n".join([*(f"noise {i}" for i in range(60)), "retry logic found", *(f"noise2 {i}" for i in range(60))])

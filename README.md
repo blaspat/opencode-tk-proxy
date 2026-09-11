@@ -14,7 +14,7 @@ Here's the pricing model: tokens cost money. Session context and tool metadata a
 - **Smart compressors per content type** — terminal output (ANSI strip), logs, diffs, HTML, tool schemas, system prompts, JSON (structural: keys/numbers/bools preserved, long string values truncated, keys sorted for byte-stable re-serialization → upstream prompt-cache friendly)
 - **Query-Aware Compression** — threads the latest user message through as an anchor; tool-result compression keeps lines matching the query keywords instead of blind head/tail truncation
 - **Age-Based History Compression** — `AGE_SPLIT_TURNS` env (default 4, 0 disables): tool results older than N turns compress at ratio 0.15 (aggressive) instead of 0.50
-- **Recovery Store** — anything compressed is stored verbatim in SQLite (`/tmp/opencode-tk-proxy-recovery.db`, 1h TTL) with a `[ccr:<handle>]` marker appended; fetch originals back via `/recovery/{handle}`
+- **Recovery Store** — anything compressed is stored verbatim in SQLite (`/tmp/opencode-tk-proxy-recovery.db`, 1h TTL). Recovery handles are recorded in the request's `recovery_handles` stats field; they are not appended to model-visible content.
 - **Tool schemas preserved** — names, types, enums, and `required` always survive; only verbose description strings trimmed
 - **Stats API** — JSON at `/stats`: per-request entries (with skip-reason breakdown, tool savings, upstream `usage`/`cost`, local tiktoken pre/post estimates), aggregated totals, and `requests_by_path`
 - **Dashboard** — live UI at `/dashboard`: aggregate cards, per-endpoint request counts, latest-20 request table
@@ -55,7 +55,7 @@ python3 proxy.py
 - `/health` — health check
 - `/stats` — compression statistics JSON (`requests_by_path`, skip-reason totals, tools savings, upstream usage/cost, local token estimates)
 - `/dashboard` — real-time dashboard UI (requests by endpoint, savings, latest 20 requests)
-- `/recovery/{handle}` — retrieve the original content for a `[ccr:<handle>]` marker
+- `/recovery/{handle}` — retrieve the original content for a handle listed in a request's `recovery_handles` stats field
 - `/{path}` — catch-all proxy to upstream (rejects `..` traversal; forwards unrecognized JSON untouched)
 
 ## Use with the opencode CLI
@@ -147,7 +147,7 @@ The service file already points at `~/.hermes/artifacts/claire/opencode-tk-proxy
 
 - **Never change compression logic** without running `python3 -m unittest -v test_proxy` (all green required).
 - **Never log or echo `UPSTREAM_KEY`.**
-- Recovery handles: canonical marker is `[ccr:<hex>]` appended to compressed content — split on it before re-parsing JSON.
+- Recovery handles: read `recovery_handles` from the matching `/stats` entry, then fetch originals via `/recovery/{handle}`; handles are never appended to model-visible content.
 - Do not add Authorization overrides beyond the existing inject-when-missing behavior.
 
 ## Install as systemd Service (manual)
